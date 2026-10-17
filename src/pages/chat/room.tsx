@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useNavigate, useOutletContext, useParams } from 'react-router-dom'
-import { AlertCircle, Check, ChevronUp, Loader2, MessageSquare, Users, X } from 'lucide-react'
+import { AlertCircle, Check, ChevronUp, Loader2, Lock, MessageSquare, Users, X } from 'lucide-react'
 import api from '@/lib/api'
 import { apiErrorMessage } from '@/lib/errors'
 import type { AppSocket } from '@/lib/app-socket'
@@ -13,24 +13,42 @@ import type {
   MessageReply,
   PaginatedMessages,
   Participant,
+  SendMessageResult,
 } from '@/types/api'
 import { useAuth } from '@/contexts/auth-context'
 import { useSocket } from '@/contexts/socket-context'
 import { usePresence } from '@/contexts/presence-context'
 import { presenceLabel } from '@/lib/presence'
+import { canReplyPrivately } from '@/lib/messages'
 import { Button } from '@/components/ui/button'
 import { Composer, type ComposerHandle, type ComposerSendInput } from '@/components/chat/composer'
 import { Lightbox } from '@/components/chat/message-attachments'
 import { MessageItem } from '@/components/chat/message-item'
 import { ConversationHeader } from '@/components/chat/conversation-header'
 import { MemberPanel } from '@/components/chat/member-panel'
+import { MediaPanel } from '@/components/chat/media-panel'
+import { MessageSearchPanel } from '@/components/chat/message-search-panel'
 import { ProfileDialog } from '@/components/chat/profile-dialog'
 import { ForwardDialog } from '@/components/chat/forward-dialog'
+import { MessageInfoDialog } from '@/components/chat/message-info-dialog'
 import type { ChatOutletContext } from '@/pages/chat/context'
 
 const PAGE_SIZE = 30
 
-type AckResult = { ok?: boolean; message?: Message; error?: string }
+/**
+ * Delivery status only ever moves forward (`sent` -> `delivered` -> `read`).
+ * The `message:status` event is conversation-scoped, so a stale `delivered`
+ * event (e.g. when the recipient reconnects) must never overwrite a message
+ * the recipient has already read.
+ */
+const STATUS_RANK: Record<Message['status'], number> = { sent: 0, delivered: 1, read: 2 }
+
+type AckResult = {
+  ok?: boolean
+  message?: Message
+  conversation?: Conversation
+  error?: string
+}
 
 /** Emits a socket event that expects an ack, with a safety timeout. */
 function emitWithAck(
@@ -124,9 +142,18 @@ export function ChatRoom() {
   const [lightbox, setLightbox] = useState<{ attachments: Attachment[]; index: number } | null>(null)
   const [dragActive, setDragActive] = useState(false)
   const [membersOpen, setMembersOpen] = useState(false)
+  const [mediaOpen, setMediaOpen] = useState(false)
+  const [searchOpen, setSearchOpen] = useState(false)
   const [profileUserId, setProfileUserId] = useState<string | null>(null)
   const [forwardTarget, setForwardTarget] = useState<ChatMessage | null>(null)
   const [forwardNotice, setForwardNotice] = useState<string | null>(null)
+  const [infoTarget, setInfoTarget] = useState<ChatMessage | null>(null)
+  const [privateReplyNotice, setPrivateReplyNotice] = useState<{
+    name: string
+    conversationId: string | null
+  } | null>(null)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [locatingMessage, setLocatingMessage] = useState(false)
 
   const scrollRef = useRef<HTMLDivElement>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
@@ -134,6 +161,8 @@ export function ChatRoom() {
   const dragDepth = useRef(0)
   const skipAutoScroll = useRef(false)
   const messagesRef = useRef<ChatMessage[]>([])
+  const cursorRef = useRef<string | null>(null)
+  const hasMoreRef = useRef(false)
   const messageRefs = useRef(new Map<string, HTMLDivElement>())
   const highlightTimer = useRef<number | undefined>(undefined)
 
@@ -178,6 +207,14 @@ export function ChatRoom() {
     messagesRef.current = messages
   }, [messages])
 
+  useEffect(() => {
+    cursorRef.current = cursor
+  }, [cursor])
+
+  useEffect(() => {
+    hasMoreRef.current = hasMore
+  }, [hasMore])
+
   /* ------------------------------ initial load ----------------------------- */
   useEffect(() => {
     if (!conversationId) return
@@ -221,21 +258,43 @@ export function ChatRoom() {
     void loadConversationPresence(conversationId)
   }, [conversationId, loadConversationPresence])
 
-  // The members panel and any open profile belong to the previous conversation.
+  // The members panel, media panel, search and any open profile belong to the
+  // previous conversation.
   useEffect(() => {
     setMembersOpen(false)
+    setMediaOpen(false)
+    setSearchOpen(false)
+    setEditingId(null)
     setProfileUserId(null)
+    setPendingJumpId(null)
+    setLocatingMessage(false)
+    setInfoTarget(null)
+    setPrivateReplyNotice(null)
   }, [conversationId])
 
-  // Escape closes the members drawer (unless a profile dialog is on top of it).
+  // Escape backs out one layer at a time: dialogs (profile, forward, lightbox)
+  // handle it themselves, then search, then the side panels, then the chat.
   useEffect(() => {
-    if (!membersOpen) return
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape' && profileUserId === null) setMembersOpen(false)
+      if (event.key !== 'Escape') return
+      if (profileUserId || lightbox || forwardTarget || infoTarget) return
+      if (searchOpen) {
+        event.stopPropagation()
+        setSearchOpen(false)
+        return
+      }
+      if (membersOpen || mediaOpen) {
+        event.stopPropagation()
+        setMembersOpen(false)
+        setMediaOpen(false)
+        return
+      }
+      event.stopPropagation()
+      navigate('/chat')
     }
     document.addEventListener('keydown', onKeyDown)
     return () => document.removeEventListener('keydown', onKeyDown)
-  }, [membersOpen, profileUserId])
+  }, [profileUserId, lightbox, forwardTarget, infoTarget, searchOpen, membersOpen, mediaOpen, navigate])
 
   /* ------------------------------ scroll to end ---------------------------- */
   useEffect(() => {
@@ -289,12 +348,27 @@ export function ChatRoom() {
       )
     }
 
+    // Another participant edited one of their messages: replace its content in
+    // place. The editor themself gets the updated message via the ack instead.
+    const handleEdited = (...args: unknown[]) => {
+      const incoming = args[0] as Message
+      if (incoming?.conversationId !== conversationId) return
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === incoming.id
+            ? { ...normalizeMessage(incoming), pending: m.pending, failed: m.failed }
+            : m,
+        ),
+      )
+    }
+
     const handleStatus = (...args: unknown[]) => {
       const payload = args[0] as { conversationId: string; status: Message['status'] }
       if (payload?.conversationId !== conversationId) return
       setMessages((prev) =>
         prev.map((m) =>
-          m.sender.id === user?.id && m.status !== payload.status
+          m.sender.id === user?.id &&
+          (STATUS_RANK[payload.status] ?? 0) > (STATUS_RANK[m.status] ?? 0)
             ? { ...m, status: payload.status }
             : m,
         ),
@@ -313,6 +387,7 @@ export function ChatRoom() {
     }
 
     socket.on('message:new', handleNew)
+    socket.on('message:edited', handleEdited)
     socket.on('typing:update', handleTyping)
     socket.on('recording:update', handleRecording)
     socket.on('message:status', handleStatus)
@@ -321,6 +396,7 @@ export function ChatRoom() {
 
     return () => {
       socket.off('message:new', handleNew)
+      socket.off('message:edited', handleEdited)
       socket.off('typing:update', handleTyping)
       socket.off('recording:update', handleRecording)
       socket.off('message:status', handleStatus)
@@ -355,42 +431,63 @@ export function ChatRoom() {
 
   /* --------------------------------- sending ------------------------------- */
 
-  /** Sends through the socket when media is attached, REST otherwise. */
+  /** Sends over the socket; falls back to REST for text when the socket is unavailable. */
   const deliver = useCallback(
-    async (input: ComposerSendInput): Promise<Message> => {
-      if (input.attachments.length > 0) {
-        if (!socket || !connected) {
-          throw new Error('You are offline. Voice messages and files need a connection.')
-        }
+    async (input: ComposerSendInput): Promise<SendMessageResult> => {
+      if (socket && connected) {
         const result = await emitWithAck(socket, 'message:send', {
           conversationId,
           content: input.content || undefined,
           type: input.type,
-          attachments: input.attachments,
+          attachments: input.attachments.length > 0 ? input.attachments : undefined,
           replyToId: input.replyToId,
+          replyPrivately: input.replyPrivately,
           clientTempId: crypto.randomUUID(),
         })
         if (!result.ok || !result.message) {
           throw new Error(result.error || 'Message failed to send.')
         }
-        return result.message
+        return { message: result.message, conversation: result.conversation }
       }
 
-      const res = await api.post<{ message: Message }>(`/conversations/${conversationId}/messages`, {
-        content: input.content,
+      // No socket: everything still goes over REST — `POST /conversations/:id/messages`
+      // accepts the confirmed `attachments` exactly like `message:send` does.
+      const res = await api.post<SendMessageResult>(`/conversations/${conversationId}/messages`, {
+        content: input.content || undefined,
+        type: input.type,
+        ...(input.attachments.length > 0 ? { attachments: input.attachments } : {}),
         ...(input.replyToId ? { replyToId: input.replyToId } : {}),
+        ...(input.replyPrivately ? { replyPrivately: true } : {}),
       })
-      return res.data.message
+      return res.data
     },
     [conversationId, socket, connected],
   )
 
   const sendMessage = useCallback(
     async (input: ComposerSendInput) => {
-      const optimisticId = `pending:${crypto.randomUUID()}`
       const source = input.replyToId
         ? messagesRef.current.find((m) => m.id === input.replyToId)
         : undefined
+
+      // A private reply is delivered as a DM to the quoted author, so it does
+      // not belong in the open conversation's list — track it via a notice.
+      if (input.replyPrivately && source) {
+        setActionError(null)
+        const result = await deliver(input)
+        if (result.conversation) upsertConversation(result.conversation)
+        const authorId = source.sender.id
+        const existing = conversations.find(
+          (c) => c.type === 'direct' && c.participants.some((p) => p.id === authorId),
+        )
+        setPrivateReplyNotice({
+          name: source.sender.displayName || source.sender.username,
+          conversationId: result.conversation?.id ?? existing?.id ?? null,
+        })
+        return result.message
+      }
+
+      const optimisticId = `pending:${crypto.randomUUID()}`
       const optimistic: ChatMessage = {
         id: optimisticId,
         conversationId,
@@ -409,11 +506,11 @@ export function ChatRoom() {
       setActionError(null)
 
       try {
-        const created = await deliver(input)
+        const result = await deliver(input)
         setMessages((prev) =>
-          prev.map((m) => (m.id === optimisticId ? normalizeMessage(created) : m)),
+          prev.map((m) => (m.id === optimisticId ? normalizeMessage(result.message) : m)),
         )
-        return created
+        return result.message
       } catch (err) {
         setMessages((prev) =>
           prev.map((m) => (m.id === optimisticId ? { ...m, pending: false, failed: true } : m)),
@@ -421,7 +518,7 @@ export function ChatRoom() {
         throw err instanceof Error ? err : new Error('Message failed to send.')
       }
     },
-    [conversationId, deliver, meParticipant],
+    [conversationId, deliver, meParticipant, conversations, upsertConversation],
   )
 
   const retryMessage = useCallback(
@@ -432,14 +529,14 @@ export function ChatRoom() {
       )
       setActionError(null)
       try {
-        const created = await deliver({
+        const result = await deliver({
           content: message.content,
           type: message.type,
           attachments: message.attachments,
           replyToId: message.replyTo?.id,
         })
         setMessages((prev) =>
-          prev.map((m) => (m.id === message.id ? normalizeMessage(created) : m)),
+          prev.map((m) => (m.id === message.id ? normalizeMessage(result.message) : m)),
         )
       } catch (err) {
         setMessages((prev) =>
@@ -482,6 +579,11 @@ export function ChatRoom() {
     setForwardTarget(message)
   }, [])
 
+  const handleMessageInfo = useCallback((message: ChatMessage) => {
+    if (message.pending || message.failed) return
+    setInfoTarget(message)
+  }, [])
+
   const handleForwarded = useCallback(
     (result: ForwardResult) => {
       for (const updated of result.conversations ?? []) upsertConversation(updated)
@@ -509,12 +611,93 @@ export function ChatRoom() {
     return () => window.clearTimeout(timer)
   }, [forwardNotice])
 
+  /* -------------------------------- editing -------------------------------- */
+
+  const startEdit = useCallback((message: ChatMessage) => {
+    if (message.pending || message.failed) return
+    setEditingId(message.id)
+  }, [])
+
+  const cancelEdit = useCallback(() => setEditingId(null), [])
+
+  const submitEdit = useCallback(
+    async (message: ChatMessage, content: string) => {
+      setActionError(null)
+
+      // Replace the message in place, keeping any optimistic flags untouched.
+      const apply = (updated: Message) => {
+        setMessages((prev) =>
+          prev.map((m) =>
+            m.id === updated.id
+              ? { ...normalizeMessage(updated), pending: m.pending, failed: m.failed }
+              : m,
+          ),
+        )
+      }
+
+      try {
+        if (socket && connected) {
+          const result = await emitWithAck(socket, 'message:edit', {
+            conversationId,
+            messageId: message.id,
+            content,
+          })
+          if (!result.ok || !result.message) {
+            throw new Error(result.error || 'The message could not be edited.')
+          }
+          apply(result.message)
+        } else {
+          const res = await api.patch<{ message: Message }>(
+            `/conversations/${conversationId}/messages/${message.id}`,
+            { content },
+          )
+          apply(res.data.message)
+        }
+        setEditingId(null)
+      } catch (err) {
+        setActionError(apiErrorMessage(err, 'The message could not be edited.'))
+        // Rethrow so the inline editor stays open and keeps the draft.
+        throw err instanceof Error ? err : new Error('The message could not be edited.')
+      }
+    },
+    [conversationId, socket, connected],
+  )
+
+  /* --------------------------- panels / overlays --------------------------- */
+
+  // Members, media and search share the same space, so opening one closes the others.
+  const toggleSearch = useCallback(() => {
+    setSearchOpen((open) => {
+      if (!open) {
+        setMediaOpen(false)
+        setMembersOpen(false)
+      }
+      return !open
+    })
+  }, [])
+
+  const toggleMedia = useCallback(() => {
+    setMediaOpen((open) => {
+      if (!open) {
+        setSearchOpen(false)
+        setMembersOpen(false)
+      }
+      return !open
+    })
+  }, [])
+
   const handleOpenInfo = useCallback(() => {
     if (isGroup) {
+      setSearchOpen(false)
+      setMediaOpen(false)
       setMembersOpen((open) => !open)
       return
     }
-    if (otherParticipant?.id) setProfileUserId(otherParticipant.id)
+    if (otherParticipant?.id) {
+      setSearchOpen(false)
+      setMediaOpen(false)
+      setProfileUserId(otherParticipant.id)
+    }
   }, [isGroup, otherParticipant])
 
   const jumpToMessage = useCallback((id: string) => {
@@ -541,6 +724,58 @@ export function ChatRoom() {
       jumpToMessage(id)
     }
   }, [pendingJumpId, messages, jumpToMessage])
+
+  /**
+   * Jumps to a message chosen from search results. The target may live on an
+   * older page that has not been fetched yet, so walk backwards until it is
+   * loaded (bounded), letting the `pendingJumpId` effect do the actual scroll.
+   */
+  const revealMessage = useCallback(
+    async (messageId: string) => {
+      setSearchOpen(false)
+      if (messageRefs.current.has(messageId)) {
+        jumpToMessage(messageId)
+        return
+      }
+      setPendingJumpId(messageId)
+      if (!hasMoreRef.current) return
+
+      setLocatingMessage(true)
+      try {
+        let next = cursorRef.current
+        let guard = 0
+        while (next && guard < 20) {
+          guard += 1
+          const res = await api.get<PaginatedMessages>(
+            `/conversations/${conversationId}/messages`,
+            { params: { limit: PAGE_SIZE, cursor: next } },
+          )
+          const older = [...res.data.items].reverse().map(normalizeMessage)
+          skipAutoScroll.current = true
+          setMessages((prev) => {
+            const existing = new Set(prev.map((m) => m.id))
+            const additions = older.filter((m) => !existing.has(m.id))
+            return additions.length > 0 ? [...additions, ...prev] : prev
+          })
+          if (older.some((m) => m.id === messageId)) break
+          if (!res.data.hasMore) break
+          next = res.data.nextCursor
+        }
+      } catch (err) {
+        setActionError(apiErrorMessage(err, 'Could not load the message.'))
+      } finally {
+        setLocatingMessage(false)
+      }
+    },
+    [conversationId, jumpToMessage],
+  )
+
+  const handleSearchSelect = useCallback(
+    (messageId: string) => {
+      void revealMessage(messageId)
+    },
+    [revealMessage],
+  )
 
   useEffect(() => {
     return () => window.clearTimeout(highlightTimer.current)
@@ -625,9 +860,21 @@ export function ChatRoom() {
           infoActive={isGroup ? membersOpen : false}
           onOpenInfo={handleOpenInfo}
           onBack={() => navigate('/chat')}
+          searchActive={searchOpen}
+          onToggleSearch={toggleSearch}
+          mediaActive={mediaOpen}
+          onToggleMedia={toggleMedia}
         />
 
-        <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-4">
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          {locatingMessage && (
+            <div className="flex items-center justify-center gap-2 border-b bg-muted/60 px-4 py-2 text-xs text-muted-foreground">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" aria-hidden="true" />
+              Finding the message…
+            </div>
+          )}
+
+          <div ref={scrollRef} className="min-h-0 flex-1 overflow-y-auto px-3 py-4 sm:px-4">
           {hasMore && (
             <div className="mb-4 flex justify-center">
               <Button
@@ -718,8 +965,13 @@ export function ChatRoom() {
                         }
                         onReply={handleReply}
                         onForward={handleForward}
+                        onOpenInfo={handleMessageInfo}
                         onRetry={(target) => void retryMessage(target)}
                         onJumpToMessage={jumpToMessage}
+                        onStartEdit={startEdit}
+                        editing={editingId === message.id}
+                        onCancelEdit={cancelEdit}
+                        onSubmitEdit={submitEdit}
                       />
                     </div>
                   </div>
@@ -753,6 +1005,36 @@ export function ChatRoom() {
           </div>
         )}
 
+        {privateReplyNotice && (
+          <div className="flex items-center gap-2 border-t bg-primary/10 px-4 py-2 text-xs text-primary">
+            <Lock className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+            <span className="flex-1">
+              Replied privately to {privateReplyNotice.name}
+            </span>
+            {privateReplyNotice.conversationId && (
+              <button
+                type="button"
+                onClick={() => {
+                  const target = privateReplyNotice.conversationId
+                  setPrivateReplyNotice(null)
+                  if (target) navigate(`/chat/${target}`)
+                }}
+                className="font-medium underline underline-offset-2"
+              >
+                Open chat
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={() => setPrivateReplyNotice(null)}
+              aria-label="Dismiss"
+              className="flex h-5 w-5 items-center justify-center rounded hover:bg-primary/10"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          </div>
+        )}
+
         {actionError && (
           <div className="flex items-center gap-2 border-t bg-destructive/10 px-4 py-2 text-xs text-destructive">
             <AlertCircle className="h-3.5 w-3.5 shrink-0" aria-hidden="true" />
@@ -773,6 +1055,11 @@ export function ChatRoom() {
           conversationId={conversationId}
           replyTo={replyTo}
           onCancelReply={cancelReply}
+          canReplyPrivately={
+            Boolean(isGroup) &&
+            replyTo !== null &&
+            canReplyPrivately(replyTo, replyTo.sender.id === user?.id)
+          }
           onSend={sendMessage}
           onTyping={handleTyping}
           onRecordingChange={handleRecordingChange}
@@ -786,7 +1073,35 @@ export function ChatRoom() {
             onClose={() => setLightbox(null)}
           />
         )}
+
+        {searchOpen && (
+          <div className="absolute inset-0 z-20 bg-background">
+            <MessageSearchPanel
+              conversation={conversation}
+              meId={user?.id}
+              onSelect={handleSearchSelect}
+              onClose={() => setSearchOpen(false)}
+            />
+          </div>
+        )}
+        </div>
       </div>
+
+      {mediaOpen && (
+        <>
+          <div
+            className="fixed inset-0 z-40 bg-black/40 backdrop-blur-sm lg:hidden"
+            onClick={() => setMediaOpen(false)}
+            aria-hidden="true"
+          />
+          <MediaPanel
+            conversation={conversation}
+            onOpenMedia={(attachments, index) => setLightbox({ attachments, index })}
+            onClose={() => setMediaOpen(false)}
+            className="fixed inset-y-0 right-0 z-50 w-80 max-w-[85vw] lg:static lg:z-auto lg:w-72 lg:max-w-none"
+          />
+        </>
+      )}
 
       {isGroup && membersOpen && (
         <>
@@ -825,6 +1140,14 @@ export function ChatRoom() {
         conversations={conversations}
         meId={user?.id}
         onForwarded={handleForwarded}
+      />
+
+      <MessageInfoDialog
+        open={infoTarget !== null}
+        onOpenChange={(open) => {
+          if (!open) setInfoTarget(null)
+        }}
+        message={infoTarget}
       />
     </div>
   )

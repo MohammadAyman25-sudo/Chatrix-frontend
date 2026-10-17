@@ -15,6 +15,14 @@ export function otherParticipant(
   )
 }
 
+/**
+ * True when `userId` owns the group. Only the owner may remove members
+ * (`DELETE /conversations/:id/participants/:participantId`).
+ */
+export function isGroupOwner(conversation: Conversation, userId: string | undefined): boolean {
+  return conversation.type === 'group' && Boolean(userId) && conversation.ownerId === userId
+}
+
 /** Group name, or the other member's display name for a direct chat. */
 export function conversationTitle(conversation: Conversation, meId: string | undefined): string {
   if (conversation.type === 'group') return conversation.name || 'Group'

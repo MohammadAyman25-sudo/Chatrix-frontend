@@ -8,13 +8,19 @@
 import type {
   Attachment,
   Conversation,
+  MediaFilter,
   Message,
+  MessageInfo,
+  MessageInfoEntry,
+  MessageMediaItem,
   MessageReply,
+  MessageSearchHit,
   Participant,
   PublicUser,
 } from '@/types/api'
+import { EDIT_WINDOW_MS } from '@/lib/messages'
 
-export const MOCK_STORAGE_KEY = 'chatrix-mock-state-v3'
+export const MOCK_STORAGE_KEY = 'chatrix-mock-state-v5'
 
 const now = Date.now()
 const at = (minutesAgo: number) => new Date(now - minutesAgo * 60_000).toISOString()
@@ -225,15 +231,19 @@ function seedState(): MockState {
       type: 'direct',
       name: null,
       avatarUrl: null,
+      ownerId: null,
       participants: [ME, toParticipant('u_maya')],
-      lastMessageAt: at(4),
+      lastMessageAt: at(2),
       createdAt: daysAgo(9),
+      unreadCount: 2,
     },
     {
       id: 'c_design',
       type: 'group',
       name: 'Design Crew',
       avatarUrl: 'https://picsum.photos/seed/chatrix-design-crew/240/240',
+      // The signed-in user owns this group, so the kick action is demoable.
+      ownerId: ME.id,
       participants: [
         ME,
         toParticipant('u_maya'),
@@ -241,26 +251,32 @@ function seedState(): MockState {
         toParticipant('u_priya'),
         toParticipant('u_sam'),
       ],
-      lastMessageAt: at(18),
+      lastMessageAt: at(10),
       createdAt: daysAgo(21),
+      unreadCount: 5,
     },
     {
       id: 'c_diego',
       type: 'direct',
       name: null,
       avatarUrl: null,
+      ownerId: null,
       participants: [ME, toParticipant('u_diego')],
       lastMessageAt: at(150),
       createdAt: daysAgo(14),
+      unreadCount: 0,
     },
     {
       id: 'c_trip',
       type: 'group',
       name: 'Weekend Trip',
       avatarUrl: null,
+      // Owned by someone else: no kick controls for the signed-in user.
+      ownerId: 'u_sam',
       participants: [ME, toParticipant('u_sam'), toParticipant('u_kofi')],
       lastMessageAt: daysAgo(2),
       createdAt: daysAgo(5),
+      unreadCount: 1,
     },
   ]
 
@@ -286,6 +302,7 @@ function seedState(): MockState {
         at(12),
       ),
       msg('m6', 'c_maya', 'u_maya', 'Perfect, listening now 🎧', at(4)),
+      msg('m7', 'c_maya', 'u_alice', 'Here is the revised spec: https://chatrix.dev/specs/composer-v2', at(2), 'sent'),
     ],
     c_design: [
       msg('d1', 'c_design', 'u_sam', 'Standup in 10 — agenda is in the doc.', at(180)),
@@ -315,6 +332,7 @@ function seedState(): MockState {
         at(30),
       ),
       msg('d6', 'c_design', 'u_maya', 'That easing is so smooth 😍', at(18)),
+      msg('d7', 'c_design', 'u_diego', 'All the docs live at https://chatrix.dev/docs/icons now.', at(10)),
     ],
     c_diego: [
       msg('g1', 'c_diego', 'u_diego', 'Deployed the keyset pagination fix to staging.', at(190)),
@@ -345,6 +363,7 @@ function seedState(): MockState {
   // A few seeded replies so the quoting UI is visible on first load.
   linkReply(messages.c_maya, 'm4', 'm3')
   linkReply(messages.c_maya, 'm6', 'm5')
+  linkReply(messages.c_maya, 'm7', 'm3')
   linkReply(messages.c_design, 'd3', 'd2')
   linkReply(messages.c_diego, 'g2', 'g1')
 
@@ -359,6 +378,17 @@ function loadState(): MockState {
     if (!parsed?.conversations?.length || !parsed.messages) return seedState()
     // Always reflect the current mock "session" identity.
     parsed.user = MOCK_USERS.find((u) => u.id === parsed.user?.id) ?? MOCK_ME
+    // Older saved states predate `unreadCount`.
+    parsed.conversations = parsed.conversations.map((conversation) => ({
+      ...conversation,
+      unreadCount: conversation.unreadCount ?? 0,
+      // Older saved states predate `ownerId`: mirror the backend's fallback to
+      // the first participant for groups that were created before ownership.
+      ownerId:
+        conversation.type === 'group'
+          ? (conversation.ownerId ?? conversation.participants[0]?.id ?? null)
+          : null,
+    }))
     return parsed
   } catch {
     return seedState()
@@ -428,6 +458,25 @@ export function appendMessage(message: Message) {
   saveState()
 }
 
+/**
+ * Bump a conversation's unread badge for a message addressed to the current
+ * user (used for simulated incoming messages — own messages never count).
+ */
+export function incrementUnread(conversationId: string) {
+  const conversation = findConversation(conversationId)
+  if (!conversation) return
+  conversation.unreadCount = (conversation.unreadCount ?? 0) + 1
+  saveState()
+}
+
+/** Clear a conversation's unread badge (`message:read`). */
+export function markConversationRead(conversationId: string) {
+  const conversation = findConversation(conversationId)
+  if (!conversation || !conversation.unreadCount) return
+  conversation.unreadCount = 0
+  saveState()
+}
+
 export function createConversation(input: {
   type: 'direct' | 'group'
   name: string | null
@@ -450,9 +499,12 @@ export function createConversation(input: {
     type: input.type,
     name: input.type === 'group' ? input.name : null,
     avatarUrl: null,
+    // The creator owns the group (mirrors the backend's `Conversation.owner`).
+    ownerId: input.type === 'group' ? state.user.id : null,
     participants: participantIds.map(toParticipant),
     lastMessageAt: null,
     createdAt: new Date().toISOString(),
+    unreadCount: 0,
   }
   state.conversations.unshift(conversation)
   state.messages[conversation.id] = []
@@ -500,6 +552,30 @@ export function addConversationParticipants(
   saveState()
   bus.emit('conversation:updated', conversation)
   return { conversation, added }
+}
+
+/**
+ * Remove a member from a group ("kick",
+ * `DELETE /conversations/:id/participants/:participantId`).
+ *
+ * The caller (`mockApi`) enforces owner-only access. Remaining members see the
+ * smaller participant list via `conversation:updated`; a removed member's own
+ * client drops the chat on `conversation:removed`.
+ */
+export function removeConversationParticipant(
+  id: string,
+  participantId: string,
+): Conversation | null {
+  const conversation = findConversation(id)
+  if (!conversation || conversation.type !== 'group') return null
+  conversation.participants = conversation.participants.filter((p) => p.id !== participantId)
+  saveState()
+  if (participantId === state.user.id) {
+    bus.emit('conversation:removed', { conversationId: conversation.id })
+  } else {
+    bus.emit('conversation:updated', conversation)
+  }
+  return conversation
 }
 
 /**
@@ -570,6 +646,216 @@ export function nextMessageId(): string {
   return `m_${crypto.randomUUID().slice(0, 10)}`
 }
 
+
+const SEARCH_DIGITS: Record<string, string> = {
+  '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4',
+  '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9',
+  '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4',
+  '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9',
+}
+
+function normalizeForSearch(value: string): string {
+  return value
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u064b-\u065f\u0670]/g, '')
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/[ىئ]/g, 'ي')
+    .replace(/ة/g, 'ه')
+    .replace(/ß/g, 'ss')
+    .toLowerCase()
+    .replace(/[٠-٩۰-۹]/g, (digit) => SEARCH_DIGITS[digit] ?? digit)
+}
+
+export function extractLinks(content: string): string[] {
+  const matches = content.match(/https?:\/\/[^\s<>"']+/gi) ?? []
+  const cleaned = matches.map((url) => url.replace(/[.,;:!?)]}"']+$/g, ''))
+  return Array.from(new Set(cleaned))
+}
+
+function hasAttachmentType(message: Message, type: Attachment['type']): boolean {
+  return message.attachments.some((attachment) => attachment.type === type)
+}
+
+function encodeCursor(id: string): string {
+  return btoa(id).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+}
+
+function decodeCursor(cursor: string): string {
+  const base64 = cursor.replace(/-/g, '+').replace(/_/g, '/')
+  try {
+    return atob(base64)
+  } catch {
+    return ''
+  }
+}
+
+function paginateDescending<T extends { id: string }>(
+  descending: T[],
+  cursorValue: string | null,
+  limit: number,
+): { items: T[]; nextCursor: string | null; hasMore: boolean } {
+  let start = 0
+  if (cursorValue) {
+    const cursorId = decodeCursor(cursorValue)
+    const index = descending.findIndex((m) => m.id === cursorId)
+    start = index === -1 ? 0 : index + 1
+  }
+  const page = descending.slice(start, start + limit)
+  const hasMore = start + limit < descending.length
+  const oldest = page[page.length - 1]
+  return { items: page, hasMore, nextCursor: hasMore && oldest ? encodeCursor(oldest.id) : null }
+}
+
+export function conversationMedia(
+  conversationId: string,
+  filter: MediaFilter,
+  cursor: string | null,
+  limit: number,
+): { items: MessageMediaItem[]; nextCursor: string | null; hasMore: boolean } {
+  const all = state.messages[conversationId] ?? []
+  const descending = [...all].reverse()
+  const matches = (message: Message) => {
+    switch (filter) {
+      case 'image':
+        return hasAttachmentType(message, 'image')
+      case 'video':
+        return hasAttachmentType(message, 'video')
+      case 'audio':
+        return hasAttachmentType(message, 'audio')
+      case 'file':
+        return hasAttachmentType(message, 'document')
+      case 'link':
+        return extractLinks(message.content).length > 0
+      default:
+        return message.attachments.length > 0 || extractLinks(message.content).length > 0
+    }
+  }
+  const filtered = descending.filter(matches)
+  const page = paginateDescending(filtered, cursor, limit)
+  return {
+    items: page.items.map((message) => ({ ...message, links: extractLinks(message.content) })),
+    nextCursor: page.nextCursor,
+    hasMore: page.hasMore,
+  }
+}
+
+export function searchMessages(
+  rawQuery: string,
+  cursor: string | null,
+  limit: number,
+): { items: MessageSearchHit[]; nextCursor: string | null; hasMore: boolean } {
+  const query = rawQuery.trim()
+  if (!/[\p{L}\p{N}]/u.test(query)) {
+    return { items: [], nextCursor: null, hasMore: false }
+  }
+  const tokens = normalizeForSearch(query).split(/\s+/).filter(Boolean)
+  if (tokens.length === 0) return { items: [], nextCursor: null, hasMore: false }
+
+  const entries: Array<{ id: string; message: Message; conversation: Conversation }> = []
+  for (const conversation of state.conversations) {
+    for (const message of state.messages[conversation.id] ?? []) {
+      const haystack = normalizeForSearch(
+        `${message.content} ${message.attachments.map((a) => a.name).join(' ')}`,
+      )
+      if (tokens.every((token) => haystack.includes(token))) {
+        entries.push({ id: message.id, message, conversation })
+      }
+    }
+  }
+  entries.sort((a, b) => Date.parse(b.message.createdAt) - Date.parse(a.message.createdAt))
+  const page = paginateDescending(entries, cursor, limit)
+  return {
+    items: page.items.map(({ message, conversation }) => ({ ...message, conversation })),
+    nextCursor: page.nextCursor,
+    hasMore: page.hasMore,
+  }
+}
+
+export type EditMessageResult =
+  | { ok: true; message: Message }
+  | { ok: false; status: number; error: string }
+
+export function editMessage(
+  conversationId: string,
+  messageId: string,
+  content: string,
+): EditMessageResult {
+  const list = state.messages[conversationId] ?? []
+  const message = list.find((m) => m.id === messageId)
+  if (!message) return { ok: false, status: 404, error: 'Message not found.' }
+  if (message.sender.id !== state.user.id)
+    return { ok: false, status: 403, error: 'You can only edit your own messages.' }
+  if (message.type !== 'text')
+    return { ok: false, status: 400, error: 'Only text messages can be edited.' }
+  if (Date.now() - Date.parse(message.createdAt) >= EDIT_WINDOW_MS)
+    return { ok: false, status: 400, error: 'This message is too old to edit.' }
+  const trimmed = content.trim()
+  if (!trimmed) return { ok: false, status: 400, error: 'Message content cannot be empty.' }
+  message.content = trimmed
+  message.editedAt = new Date().toISOString()
+  saveState()
+  bus.emit('message:edited', message)
+  return { ok: true, message }
+}
+
+export type MessageInfoResult =
+  | { ok: true; info: MessageInfo }
+  | { ok: false; status: number; error: string }
+
+/**
+ * Delivery/read detail for one of the current user's own messages
+ * (`GET /conversations/:id/messages/:messageId/info`). Seeded messages only
+ * carry an aggregate `status`, so per-recipient times are synthesised from it.
+ * Direct chats honour the reader's `readReceipts`; groups always show everyone.
+ */
+export function messageInfo(conversationId: string, messageId: string): MessageInfoResult {
+  const conversation = findConversation(conversationId)
+  if (!conversation) return { ok: false, status: 404, error: 'Conversation not found.' }
+  const message = (state.messages[conversationId] ?? []).find((m) => m.id === messageId)
+  if (!message) return { ok: false, status: 404, error: 'Message not found.' }
+  if (message.sender.id !== state.user.id)
+    return { ok: false, status: 403, error: 'You can only view info for your own messages.' }
+
+  const others = conversation.participants.filter((p) => p.id !== message.sender.id)
+  const sentAt = Date.parse(message.createdAt)
+  const entry = (user: Participant, offsetMs: number): MessageInfoEntry => ({
+    user,
+    at: new Date(sentAt + offsetMs).toISOString(),
+  })
+
+  // A direct chat hides the other member's read time when their receipts are off.
+  const readReceiptsDisabled =
+    conversation.type === 'direct' &&
+    others.some((p) => MOCK_USERS.find((u) => u.id === p.id)?.settings.readReceipts === false)
+
+  const deliveredTo: MessageInfoEntry[] = []
+  const readBy: MessageInfoEntry[] = []
+  const pending: Participant[] = []
+
+  if (message.status === 'read') {
+    deliveredTo.push(...others.map((p) => entry(p, 60_000)))
+    if (!readReceiptsDisabled) readBy.push(...others.map((p) => entry(p, 180_000)))
+  } else if (message.status === 'delivered') {
+    deliveredTo.push(...others.map((p) => entry(p, 60_000)))
+  } else {
+    pending.push(...others)
+  }
+
+  return {
+    ok: true,
+    info: {
+      messageId: message.id,
+      conversationId,
+      conversationType: conversation.type,
+      status: message.status,
+      deliveredTo,
+      readBy,
+      pending,
+      readReceiptsDisabled,
+    },
+  }
+}
 /* -------------------------------------------------------------------------- */
 /* Minimal event bus so the mock socket can deliver server -> client events.   */
 /* -------------------------------------------------------------------------- */
@@ -594,5 +880,4 @@ class MockBus {
     for (const handler of this.handlers.get(event) ?? []) handler(payload)
   }
 }
-
 export const bus = new MockBus()

@@ -4,6 +4,8 @@ import { cn } from 'cn'
 import api from '@/lib/api'
 import { apiErrorMessage } from '@/lib/errors'
 import type { UserSummary } from '@/types/api'
+import { AVATAR_MAX_BYTES } from '@/lib/media'
+import { uploadAvatar as uploadAvatarRequest } from '@/lib/uploads'
 import { presenceLabel } from '@/lib/presence'
 import { useAuth } from '@/contexts/auth-context'
 import { usePresence } from '@/contexts/presence-context'
@@ -12,8 +14,6 @@ import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Textarea } from '@/components/ui/textarea'
 import { Label } from '@/components/ui/label'
-
-const MAX_AVATAR_BYTES = 5 * 1024 * 1024
 
 function formatJoined(iso: string | undefined): string | null {
   if (!iso) return null
@@ -120,16 +120,16 @@ export function ProfileDialog({
   }
 
   const uploadAvatar = async (file: File) => {
-    if (file.size > MAX_AVATAR_BYTES) {
+    if (file.size > AVATAR_MAX_BYTES) {
       setSaveError('Avatar must be 5MB or smaller.')
       return
     }
     setAvatarBusy(true)
     setSaveError(null)
     try {
-      const form = new FormData()
-      form.append('avatar', file)
-      await api.post('/users/me/avatar', form)
+      // Direct-to-R2: sign → PUT → confirm (no multipart). The confirm response
+      // carries the updated user, so no extra `/auth/me` round trip is needed.
+      await uploadAvatarRequest(file)
       await refresh()
     } catch (err) {
       setSaveError(apiErrorMessage(err, 'Could not update your avatar.'))
@@ -186,6 +186,7 @@ export function ProfileDialog({
               size="lg"
               status={getPresence(userId)?.status}
               className="size-20 ring-4 ring-card"
+              viewable
             />
             {isSelf && (
               <div className="mb-1 flex items-center gap-1.5">

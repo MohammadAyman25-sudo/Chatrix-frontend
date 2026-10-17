@@ -23,8 +23,13 @@ type AuthContextType = {
   refresh: () => Promise<PublicUser | null>
   /** Redeems an email verification token. Returns the verified user. */
   verifyEmail: (token: string) => Promise<PublicUser>
-  /** Requests a fresh verification link (always succeeds, to avoid enumeration). */
-  resendVerification: (email: string) => Promise<void>
+  /** Requests a fresh verification link. Resolves with the server's confirmation message. */
+  resendVerification: (email: string) => Promise<string>
+  /**
+   * Persists a settings change (`PATCH /users/me/settings`), syncs it into the
+   * signed-in user and returns the full settings object saved by the server.
+   */
+  updateSettings: (patch: Partial<PublicUser['settings']>) => Promise<PublicUser['settings']>
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
@@ -79,8 +84,15 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return res.data.user
   }
 
-  const resendVerification = async (email: string): Promise<void> => {
-    await api.post('/auth/resend-verification', { email })
+  const resendVerification = async (email: string): Promise<string> => {
+    const res = await api.post<{ message?: string }>('/auth/resend-verification', { email })
+    return res.data?.message ?? ''
+  }
+
+  const updateSettings = async (patch: Partial<PublicUser['settings']>) => {
+    const res = await api.patch<{ settings: PublicUser['settings'] }>('/users/me/settings', patch)
+    setUser((prev) => (prev ? { ...prev, settings: res.data.settings } : prev))
+    return res.data.settings
   }
 
   const logout = async () => {
@@ -90,7 +102,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   return (
     <AuthContext.Provider
-      value={{ user, loading, login, register, logout, refresh, verifyEmail, resendVerification }}
+      value={{
+        user,
+        loading,
+        login,
+        register,
+        logout,
+        refresh,
+        verifyEmail,
+        resendVerification,
+        updateSettings,
+      }}
     >
       {children}
     </AuthContext.Provider>

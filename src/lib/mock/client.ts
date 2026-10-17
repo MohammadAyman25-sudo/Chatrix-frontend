@@ -7,13 +7,19 @@
  */
 import type {
   Attachment,
+  Conversation,
+  MediaFilter,
   Message,
   MessageType,
   PaginatedMessages,
   PublicUser,
   UserSummary,
 } from '@/types/api'
-import { attachmentType } from '@/lib/media'
+import {
+  checkUploadConstraints,
+  confirmedAttachment,
+  type SignUploadInput,
+} from '@/lib/media'
 import {
   isCompromisedPassword,
   validateRegistration,
@@ -65,6 +71,59 @@ function readFileAsDataUrl(file: File): Promise<string> {
     reader.onerror = () => reject(reader.error ?? new Error('Could not read file'))
     reader.readAsDataURL(file)
   })
+}
+
+/**
+ * Pending `POST /uploads/sign` records. The real flow PUTs the bytes to a
+ * presigned R2 URL the browser never sees here, so in mock mode the file rides
+ * along on the sign request (see `signUpload` in `@/lib/uploads`) and the
+ * `confirm` step turns it into a data URL.
+ */
+type PendingUpload = {
+  input: SignUploadInput
+  file?: File
+  /** Set once confirmed; repeat confirms return it unchanged (idempotent). */
+  result?: { attachment?: Attachment; user?: PublicUser; conversation?: Conversation }
+  status?: number
+}
+const pendingUploads = new Map<string, PendingUpload>()
+
+/** Object key convention, mirroring `buildUploadKey` on the backend. */
+function mockUploadKey(input: SignUploadInput, userId: string, uploadId: string): string {
+  const ext = extensionForMime(input.mimeType)
+  if (input.scope === 'avatar') return `avatars/${userId}/${uploadId}${ext}`
+  if (input.scope === 'group-icon') {
+    return `conversations/${input.conversationId}/icon/${uploadId}${ext}`
+  }
+  return `messages/${input.conversationId}/${userId}/${uploadId}${ext}`
+}
+
+const EXT_BY_MIME: Record<string, string> = {
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+  'image/gif': '.gif',
+  'image/svg+xml': '.svg',
+  'image/bmp': '.bmp',
+  'video/mp4': '.mp4',
+  'video/webm': '.webm',
+  'video/quicktime': '.mov',
+  'video/x-msvideo': '.avi',
+  'audio/mpeg': '.mp3',
+  'audio/mp4': '.m4a',
+  'audio/ogg': '.ogg',
+  'audio/wav': '.wav',
+  'audio/webm': '.weba',
+  'audio/aac': '.aac',
+  'application/pdf': '.pdf',
+  'text/plain': '.txt',
+  'text/csv': '.csv',
+  'application/zip': '.zip',
+  'application/json': '.json',
+}
+
+function extensionForMime(mimeType: string): string {
+  return EXT_BY_MIME[mimeType] ?? ''
 }
 
 /**
@@ -141,6 +200,7 @@ function buildIncoming(input: OutgoingMessageInput, senderId: string): Message {
     createdAt: new Date().toISOString(),
   }
   store.appendMessage(message)
+  store.incrementUnread(input.conversationId)
   return message
 }
 
@@ -257,6 +317,52 @@ export function createOutgoingMessage(input: OutgoingMessageInput): Message {
   return message
 }
 
+/**
+ * Delivers a reply as a **direct message to the quoted message's author**
+ * instead of to the open conversation (`replyPrivately`). Finds or creates the
+ * DM, so the caller gets `conversation` back only when one had to be created —
+ * matching the real API, which also emits `conversation:new` in that case.
+ */
+export function createPrivateReply(input: {
+  sourceConversationId: string
+  replyToId: string
+  content?: string
+  type?: MessageType
+  attachments?: Attachment[]
+}): { message: Message; conversation?: Conversation } {
+  const source = store.findConversation(input.sourceConversationId)
+  if (!source) throw new MockError(404, 'Conversation not found.')
+  const list = store.getState().messages[input.sourceConversationId] ?? []
+  const quoted = list.find((m) => m.id === input.replyToId)
+  if (!quoted) throw new MockError(400, 'The quoted message is not in this conversation.')
+  if (quoted.sender.id === store.currentUser().id) {
+    throw new MockError(400, 'You cannot reply privately to your own message.')
+  }
+
+  const { conversation, created } = store.createConversation({
+    type: 'direct',
+    name: null,
+    participantIds: [quoted.sender.id],
+  })
+  const attachments = input.attachments ?? []
+  const message: Message = {
+    id: store.nextMessageId(),
+    conversationId: conversation.id,
+    content: input.content ?? '',
+    type: input.type ?? (attachments[0]?.type ?? 'text'),
+    attachments,
+    sender: store.toParticipant(store.currentUser().id),
+    replyTo: store.toReplySnapshot(quoted),
+    status: 'sent',
+    editedAt: null,
+    forwarded: false,
+    createdAt: new Date().toISOString(),
+  }
+  store.appendMessage(message)
+  scheduleAutoReply(conversation.id, message)
+  return { message, conversation: created ? conversation : undefined }
+}
+
 export const mockApi = {
   async get<T>(url: string, config: RequestConfig = {}): Promise<MockResponse<T>> {
     await guard(config.signal)
@@ -290,6 +396,40 @@ export const mockApi = {
         cursor ?? null,
         Number.isFinite(limit) ? limit : 30,
       )
+      return { data: data as T, status: 200 }
+    }
+
+    const messageInfoMatch = pathname.match(/^\/conversations\/([^/]+)\/messages\/([^/]+)\/info$/)
+    if (messageInfoMatch) {
+      const result = store.messageInfo(
+        decodeURIComponent(messageInfoMatch[1]),
+        decodeURIComponent(messageInfoMatch[2]),
+      )
+      if (!result.ok) throw new MockError(result.status, result.error)
+      return { data: { info: result.info } as T, status: 200 }
+    }
+
+    // `GET /conversations/:id/media` — attachments/links, filtered and paginated.
+    const mediaMatch = pathname.match(/^\/conversations\/([^/]+)\/media$/)
+    if (mediaMatch) {
+      const filter = String(params.type ?? searchParams.get('type') ?? 'all') as MediaFilter
+      const limit = Number(params.limit ?? searchParams.get('limit') ?? 30)
+      const cursor = (params.cursor as string | undefined) ?? searchParams.get('cursor')
+      const data = store.conversationMedia(
+        decodeURIComponent(mediaMatch[1]),
+        filter,
+        cursor ?? null,
+        Number.isFinite(limit) ? limit : 30,
+      )
+      return { data: data as T, status: 200 }
+    }
+
+    // `GET /messages/search` — spans every conversation the caller belongs to.
+    if (pathname === '/messages/search') {
+      const q = String(params.q ?? searchParams.get('q') ?? '')
+      const limit = Number(params.limit ?? searchParams.get('limit') ?? 20)
+      const cursor = (params.cursor as string | undefined) ?? searchParams.get('cursor')
+      const data = store.searchMessages(q, cursor ?? null, Number.isFinite(limit) ? limit : 20)
       return { data: data as T, status: 200 }
     }
 
@@ -393,14 +533,6 @@ export const mockApi = {
       return { data: undefined as T, status: 204 }
     }
 
-    if (pathname === '/users/me/avatar') {
-      if (!(body instanceof FormData)) throw new MockError(400, 'Expected multipart/form-data')
-      const file = body.get('avatar')
-      if (!(file instanceof File)) throw new MockError(400, 'No avatar was uploaded.')
-      store.setCurrentUser({ ...store.currentUser(), avatarUrl: await readFileAsDataUrl(file) })
-      return { data: { user: store.currentUser() } as T, status: 200 }
-    }
-
     if (pathname === '/conversations') {
       const input = body as {
         type: 'direct' | 'group'
@@ -413,19 +545,6 @@ export const mockApi = {
         participantIds: input.participantIds ?? [],
       })
       return { data: { conversation } as T, status: created ? 201 : 200 }
-    }
-
-    const groupAvatarMatch = pathname.match(/^\/conversations\/([^/]+)\/avatar$/)
-    if (groupAvatarMatch) {
-      if (!(body instanceof FormData)) throw new MockError(400, 'Expected multipart/form-data')
-      const file = body.get('avatar')
-      if (!(file instanceof File)) throw new MockError(400, 'No icon was uploaded.')
-      const conversation = store.setConversationAvatar(
-        decodeURIComponent(groupAvatarMatch[1]),
-        await readFileAsDataUrl(file),
-      )
-      if (!conversation) throw new MockError(404, 'Group not found.')
-      return { data: { conversation } as T, status: 200 }
     }
 
     const participantsMatch = pathname.match(/^\/conversations\/([^/]+)\/participants$/)
@@ -442,26 +561,110 @@ export const mockApi = {
       return { data: { conversation: result.conversation } as T, status: 200 }
     }
 
-    const attachmentsMatch = pathname.match(/^\/conversations\/([^/]+)\/attachments$/)
-    if (attachmentsMatch) {
-      if (!(body instanceof FormData)) throw new MockError(400, 'Expected multipart/form-data')
-      const files = body.getAll('files').filter((entry): entry is File => entry instanceof File)
-      if (files.length === 0) throw new MockError(400, 'No files were uploaded.')
-      const durationValue = Number(body.get('duration'))
-      const duration = Number.isFinite(durationValue) && durationValue > 0 ? durationValue : undefined
-      const attachments: Attachment[] = []
-      for (const file of files) {
-        const type = attachmentType(file.type, file.name)
-        attachments.push({
-          type,
-          url: await readFileAsDataUrl(file),
-          name: file.name || 'Untitled',
-          size: file.size,
-          mimeType: file.type || 'application/octet-stream',
-          ...(type === 'audio' && duration ? { duration } : {}),
+    // `POST /uploads/sign` — step 1 of the direct-to-R2 flow: validate the
+    // request (scope, membership, MIME, size) and hand back a presigned PUT.
+    if (pathname === '/uploads/sign') {
+      const input = (body ?? {}) as SignUploadInput & { file?: File }
+      const issues: RegistrationIssue[] = []
+      if (!['message', 'avatar', 'group-icon'].includes(input.scope)) {
+        issues.push({
+          code: 'invalid_enum',
+          path: ['scope'],
+          message: 'Must be one of: message, avatar, group-icon',
         })
       }
-      return { data: { attachments } as T, status: 201 }
+      if (!input.name?.trim()) {
+        issues.push({ code: 'too_small', path: ['name'], message: 'Required' })
+      }
+      if (!input.mimeType?.trim()) {
+        issues.push({ code: 'too_small', path: ['mimeType'], message: 'Required' })
+      }
+      if (!Number.isInteger(input.size) || input.size <= 0) {
+        issues.push({ code: 'invalid_type', path: ['size'], message: 'Must be a positive integer' })
+      }
+      if (issues.length > 0) throw new MockError(400, 'Validation failed', issues)
+
+      if (input.scope === 'avatar' && input.conversationId) {
+        throw new MockError(400, 'conversationId is not allowed for avatar uploads')
+      }
+      if (input.scope !== 'avatar' && !input.conversationId) {
+        throw new MockError(400, 'conversationId is required for this upload')
+      }
+
+      let conversation: Conversation | undefined
+      if (input.scope !== 'avatar') {
+        conversation = store.findConversation(input.conversationId as string)
+        const isMember = conversation?.participants.some((p) => p.id === store.currentUser().id)
+        if (!conversation || !isMember) throw new MockError(404, 'Conversation not found')
+        if (input.scope === 'group-icon' && conversation.type !== 'group') {
+          throw new MockError(400, 'Only group conversations can have an icon')
+        }
+      }
+
+      const violation = checkUploadConstraints(input)
+      if (violation) throw new MockError(violation.status, violation.message)
+
+      const uploadId = crypto.randomUUID()
+      pendingUploads.set(uploadId, { input, file: input.file })
+      return {
+        data: {
+          upload: {
+            id: uploadId,
+            key: mockUploadKey(input, store.currentUser().id, uploadId),
+            // No bucket in the browser: the uploader skips non-http PUT targets.
+            url: `mock://uploads/${uploadId}`,
+            method: 'PUT',
+            headers: { 'Content-Type': input.mimeType },
+            expiresAt: new Date(Date.now() + 15 * 60 * 1000).toISOString(),
+          },
+        } as T,
+        status: 201,
+      }
+    }
+
+    // `POST /uploads/:uploadId/confirm` — step 3: the bytes "landed", so answer
+    // with the attachment / updated user / updated conversation. Idempotent.
+    const uploadConfirmMatch = pathname.match(/^\/uploads\/([^/]+)\/confirm$/)
+    if (uploadConfirmMatch) {
+      const uploadId = decodeURIComponent(uploadConfirmMatch[1])
+      const record = pendingUploads.get(uploadId)
+      if (!record) throw new MockError(404, 'Upload not found')
+      if (record.result) return { data: record.result as T, status: record.status ?? 200 }
+
+      // The mock PUT is skipped, so a sign without a file mirrors the backend's
+      // "the object never landed" rejection (the record survives for a retry).
+      if (!record.file) {
+        throw new MockError(400, 'No file found for this upload. Upload it to the signed URL first.')
+      }
+      if (record.file.size !== record.input.size) {
+        pendingUploads.delete(uploadId)
+        throw new MockError(
+          400,
+          `Uploaded size (${record.file.size} bytes) does not match the declared size (${record.input.size} bytes)`,
+        )
+      }
+
+      const url = await readFileAsDataUrl(record.file)
+      if (record.input.scope === 'message') {
+        const attachment = confirmedAttachment(record.input, url)
+        record.result = { attachment }
+        record.status = 201
+        return { data: { attachment } as T, status: 201 }
+      }
+      if (record.input.scope === 'avatar') {
+        store.setCurrentUser({ ...store.currentUser(), avatarUrl: url })
+        record.result = { user: store.currentUser() }
+        record.status = 200
+        return { data: { user: store.currentUser() } as T, status: 200 }
+      }
+      const conversation = store.setConversationAvatar(
+        record.input.conversationId as string,
+        url,
+      )
+      if (!conversation) throw new MockError(404, 'Group not found')
+      record.result = { conversation }
+      record.status = 200
+      return { data: { conversation } as T, status: 200 }
     }
 
     const messagesMatch = pathname.match(/^\/conversations\/([^/]+)\/messages$/)
@@ -471,9 +674,26 @@ export const mockApi = {
         type?: MessageType
         attachments?: Attachment[]
         replyToId?: string
+        replyPrivately?: boolean
+      }
+      // Mirrors `sendMessageSchema`: text or at least one attachment, else 400.
+      if (!input.content?.trim() && !input.attachments?.length) {
+        throw new MockError(400, 'Message must have content or attachments')
+      }
+      const conversationId = decodeURIComponent(messagesMatch[1])
+      if (input.replyPrivately) {
+        if (!input.replyToId) throw new MockError(400, 'A reply target is required.')
+        const result = createPrivateReply({
+          sourceConversationId: conversationId,
+          replyToId: input.replyToId,
+          content: input.content,
+          type: input.type,
+          attachments: input.attachments,
+        })
+        return { data: result as T, status: 201 }
       }
       const message = createOutgoingMessage({
-        conversationId: decodeURIComponent(messagesMatch[1]),
+        conversationId,
         content: input.content ?? '',
         type: input.type,
         attachments: input.attachments,
@@ -517,12 +737,47 @@ export const mockApi = {
     }
 
     if (pathname === '/users/me/settings') {
-      const patch = body as Partial<PublicUser['settings']>
+      // Partial update: only recognised fields apply, and at least one is required
+      // (the backend's zod schema strips unknown keys then rejects an empty patch).
+      const patch = (body ?? {}) as Partial<PublicUser['settings']>
+      const fields = Object.fromEntries(
+        Object.entries(patch).filter(([key]) =>
+          ['theme', 'notifications', 'readReceipts'].includes(key),
+        ),
+      )
+      if (Object.keys(fields).length === 0) {
+        throw new MockError(400, 'Validation failed', [
+          { code: 'custom', path: [], message: 'No settings to update' },
+        ])
+      }
+      const theme = fields.theme
+      if (typeof theme === 'string' && !['light', 'dark', 'system'].includes(theme)) {
+        throw new MockError(400, 'Validation failed', [
+          {
+            code: 'invalid_enum',
+            path: ['theme'],
+            message: 'Must be one of: light, dark, system',
+          },
+        ])
+      }
       store.setCurrentUser({
         ...store.currentUser(),
-        settings: { ...store.currentUser().settings, ...patch },
+        settings: { ...store.currentUser().settings, ...fields },
       })
       return { data: { settings: store.currentUser().settings } as T, status: 200 }
+    }
+
+    // `PATCH /conversations/:id/messages/:messageId` — edit own text message.
+    const messageEditMatch = pathname.match(/^\/conversations\/([^/]+)\/messages\/([^/]+)$/)
+    if (messageEditMatch) {
+      const content = (body as { content?: string })?.content ?? ''
+      const result = store.editMessage(
+        decodeURIComponent(messageEditMatch[1]),
+        decodeURIComponent(messageEditMatch[2]),
+        content,
+      )
+      if (!result.ok) throw new MockError(result.status, result.error)
+      return { data: { message: result.message } as T, status: 200 }
     }
 
     const conversationMatch = pathname.match(/^\/conversations\/([^/]+)$/)
@@ -551,6 +806,30 @@ export const mockApi = {
       const conversation = store.setConversationAvatar(decodeURIComponent(groupAvatarMatch[1]), null)
       if (!conversation) throw new MockError(404, 'Group not found.')
       return { data: { conversation } as T, status: 200 }
+    }
+
+    // Remove a group member ("kick") — owner only.
+    const kickMatch = pathname.match(/^\/conversations\/([^/]+)\/participants\/([^/]+)$/)
+    if (kickMatch) {
+      const conversation = store.findConversation(decodeURIComponent(kickMatch[1]))
+      if (!conversation) throw new MockError(404, 'Conversation not found.')
+      if (conversation.type !== 'group') {
+        throw new MockError(400, 'You can only remove members from a group')
+      }
+      const me = store.currentUser().id
+      if (conversation.ownerId !== me) {
+        throw new MockError(403, 'Only the group owner can remove members')
+      }
+      const participantId = decodeURIComponent(kickMatch[2])
+      if (participantId === conversation.ownerId) {
+        throw new MockError(400, 'The group owner cannot be removed')
+      }
+      if (!conversation.participants.some((p) => p.id === participantId)) {
+        throw new MockError(400, 'That person is not a member of this group')
+      }
+      const updated = store.removeConversationParticipant(conversation.id, participantId)
+      if (!updated) throw new MockError(404, 'Conversation not found.')
+      return { data: { conversation: updated } as T, status: 200 }
     }
 
     throw new MockError(404, `No mock handler for DELETE ${pathname}`)

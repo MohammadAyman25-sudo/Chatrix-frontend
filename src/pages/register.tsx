@@ -34,7 +34,7 @@ export function RegisterPage() {
   const [pendingEmail, setPendingEmail] = useState<string | null>(null)
   const [demoHref, setDemoHref] = useState<string | null>(null)
   const [resending, setResending] = useState(false)
-  const [resent, setResent] = useState(false)
+  const [resentMessage, setResentMessage] = useState('')
   const [resendError, setResendError] = useState('')
   const { register, resendVerification } = useAuth()
   const navigate = useNavigate()
@@ -108,10 +108,10 @@ export function RegisterPage() {
     if (!pendingEmail || resending) return
     setResending(true)
     setResendError('')
-    setResent(false)
+    setResentMessage('')
     try {
-      await resendVerification(pendingEmail)
-      setResent(true)
+      const sent = await resendVerification(pendingEmail)
+      setResentMessage(sent)
       setDemoHref(mockVerificationHref())
     } catch (error) {
       setResendError(apiErrorMessage(error, 'Could not resend the verification email.'))
@@ -139,9 +139,9 @@ export function RegisterPage() {
             <p className="text-xs text-muted-foreground">
               Can't find it? Check your spam folder before requesting another link.
             </p>
-            {resent && (
+            {resentMessage && (
               <p role="status" className="text-sm text-emerald-600 dark:text-emerald-400">
-                Verification email sent.
+                {resentMessage}
               </p>
             )}
             {resendError && (

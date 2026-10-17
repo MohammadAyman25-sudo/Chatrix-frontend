@@ -15,7 +15,7 @@ realApi.interceptors.response.use(
     if (error.response?.status === 401 && !original._retry) {
       original._retry = true
       try {
-        await axios.post('http://localhost:5000/api/v1/auth/refresh', {}, { withCredentials: true })
+        await axios.post(`${API_ORIGIN}/api/v1/auth/refresh`, {}, { withCredentials: true })
         return realApi(original)
       } catch (e) {
         return Promise.reject(e)

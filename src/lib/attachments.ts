@@ -1,19 +1,22 @@
 /**
  * Message media helpers.
  *
- * Attachments are uploaded to `POST /conversations/:id/attachments`
- * (multipart/form-data) *before* the message is sent; the returned attachment
- * objects are then sent with the message over the `message:send` socket event.
- * See API_EXAMPLES.md.
+ * Attachments are uploaded **directly to R2** through the `sign → PUT → confirm`
+ * flow (see `@/lib/uploads` and API_EXAMPLES.md → "Uploads (direct to R2)")
+ * *before* the message is sent; the confirmed attachment objects are then sent
+ * with the message over `message:send` or `POST /conversations/:id/messages`.
  */
-import api from '@/lib/api'
-import { attachmentType, type AttachmentType } from '@/lib/media'
+import {
+  ATTACHMENT_MAX_BYTES,
+  attachmentType,
+  type AttachmentType,
+} from '@/lib/media'
 import type { Attachment, MessageType } from '@/types/api'
 
 export type { Attachment, MessageType, AttachmentType }
 
-/** Contract: up to 10 files per upload, ≤100MB each. */
-export const MAX_ATTACHMENT_BYTES = 100 * 1024 * 1024
+/** Client-side cap per send; each file is signed and confirmed on its own. */
+export const MAX_ATTACHMENT_BYTES = ATTACHMENT_MAX_BYTES
 export const MAX_ATTACHMENTS_PER_UPLOAD = 10
 
 /** Local, pre-upload attachment shown in the composer. */
@@ -49,27 +52,6 @@ export function createPendingAttachment(file: File, duration?: number): PendingA
 
 export function revokePendingAttachment(attachment: PendingAttachment) {
   if (attachment.previewUrl) URL.revokeObjectURL(attachment.previewUrl)
-}
-
-/**
- * Uploads files to the message attachments endpoint and returns their
- * server-side attachment DTOs (in the same order they were provided).
- */
-export async function uploadAttachments(
-  conversationId: string,
-  files: File[],
-  duration?: number,
-): Promise<Attachment[]> {
-  const form = new FormData()
-  for (const file of files) form.append('files', file)
-  if (duration != null && Number.isFinite(duration)) {
-    form.append('duration', String(Math.max(1, Math.round(duration))))
-  }
-  const res = await api.post<{ attachments: Attachment[] }>(
-    `/conversations/${conversationId}/attachments`,
-    form,
-  )
-  return res.data.attachments
 }
 
 export function formatBytes(bytes: number): string {

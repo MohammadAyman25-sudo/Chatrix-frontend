@@ -17,7 +17,7 @@ export function LoginPage() {
   const [needsVerification, setNeedsVerification] = useState(false)
   const [loading, setLoading] = useState(false)
   const [resending, setResending] = useState(false)
-  const [resent, setResent] = useState(false)
+  const [resentMessage, setResentMessage] = useState('')
   const [resendError, setResendError] = useState('')
   const [demoHref, setDemoHref] = useState<string | null>(null)
   const { login, resendVerification } = useAuth()
@@ -27,7 +27,7 @@ export function LoginPage() {
     e.preventDefault()
     setError('')
     setNeedsVerification(false)
-    setResent(false)
+    setResentMessage('')
     setResendError('')
     setLoading(true)
     try {
@@ -45,10 +45,10 @@ export function LoginPage() {
     if (!email.trim() || resending) return
     setResending(true)
     setResendError('')
-    setResent(false)
+    setResentMessage('')
     try {
-      await resendVerification(email.trim())
-      setResent(true)
+      const sent = await resendVerification(email.trim())
+      setResentMessage(sent)
       setDemoHref(mockVerificationHref())
     } catch (err) {
       setResendError(apiErrorMessage(err, 'Could not resend the verification email.'))
@@ -98,9 +98,9 @@ export function LoginPage() {
                   <MailCheck className="h-3.5 w-3.5 shrink-0" />
                   Didn't get the email? We can send a new verification link.
                 </p>
-                {resent && (
+                {resentMessage && (
                   <p role="status" className="text-xs text-emerald-600 dark:text-emerald-400">
-                    Verification email sent to {email.trim()}.
+                    {resentMessage}
                   </p>
                 )}
                 {resendError && (

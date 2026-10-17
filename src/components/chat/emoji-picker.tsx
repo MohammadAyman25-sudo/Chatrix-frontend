@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Smile } from 'lucide-react'
+import { Smile, X } from 'lucide-react'
 import { cn } from 'cn'
 import { Button } from '@/components/ui/button'
 
@@ -56,14 +56,9 @@ export function EmojiPicker({ onSelect, disabled }: EmojiPickerProps) {
     const onPointerDown = (event: MouseEvent) => {
       if (!containerRef.current?.contains(event.target as Node)) setOpen(false)
     }
-    const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key === 'Escape') setOpen(false)
-    }
     document.addEventListener('mousedown', onPointerDown)
-    document.addEventListener('keydown', onKeyDown)
     return () => {
       document.removeEventListener('mousedown', onPointerDown)
-      document.removeEventListener('keydown', onKeyDown)
     }
   }, [open])
 
@@ -89,6 +84,19 @@ export function EmojiPicker({ onSelect, disabled }: EmojiPickerProps) {
           aria-label="Emoji picker"
           className="absolute bottom-full left-0 z-40 mb-2 w-[calc(100vw-4rem)] max-w-xs rounded-xl border bg-popover text-popover-foreground shadow-lg ring-1 ring-foreground/5"
         >
+          <div className="flex items-center justify-between border-b px-3 py-2">
+            <span className="text-xs font-medium text-muted-foreground">Emoji</span>
+            <Button
+              type="button"
+              variant="ghost"
+              size="icon"
+              className="h-7 w-7 text-muted-foreground hover:text-foreground"
+              aria-label="Close emoji picker"
+              onClick={() => setOpen(false)}
+            >
+              <X className="h-4 w-4" />
+            </Button>
+          </div>
           <div className="max-h-64 overflow-y-auto p-3">
             {EMOJI_GROUPS.map((group) => (
               <section key={group.label} className="mb-3 last:mb-0">
@@ -100,10 +108,8 @@ export function EmojiPicker({ onSelect, disabled }: EmojiPickerProps) {
                     <button
                       key={emoji}
                       type="button"
-                      onClick={() => {
-                        onSelect(emoji)
-                        setOpen(false)
-                      }}
+                      // Stay open so the same emoji can be inserted repeatedly.
+                      onClick={() => onSelect(emoji)}
                       className={cn(
                         'flex h-8 w-8 items-center justify-center rounded-md text-lg leading-none',
                         'transition-transform hover:bg-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring active:scale-90',

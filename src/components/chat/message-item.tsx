@@ -1,9 +1,24 @@
-import { memo, useRef, useState } from 'react'
-import { AlertCircle, Check, CheckCheck, Clock, CornerUpLeft, Forward } from 'lucide-react'
+import { memo, useEffect, useRef, useState } from 'react'
+import {
+  AlertCircle,
+  Check,
+  CheckCheck,
+  Clock,
+  CornerUpLeft,
+  Forward,
+  Info,
+  Loader2,
+  Pencil,
+} from 'lucide-react'
 import { cn } from 'cn'
 import type { Attachment, ChatMessage, MessageReply } from '@/types/api'
 import { attachmentLabel } from '@/lib/attachments'
+import { textDirection } from '@/lib/direction'
+import { EDIT_WINDOW_MS, isEditableMessage, withinEditWindow } from '@/lib/messages'
 import { Avatar, AvatarFallback, AvatarImage } from '@/components/ui/avatar'
+import { Button } from '@/components/ui/button'
+import { Textarea } from '@/components/ui/textarea'
+import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip'
 import { MessageAttachments } from '@/components/chat/message-attachments'
 
 function initials(name: string): string {
@@ -18,6 +33,10 @@ function formatTime(iso: string): string {
   return new Date(iso).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
 }
 
+function formatDateTime(iso: string): string {
+  return new Date(iso).toLocaleString([], { dateStyle: 'medium', timeStyle: 'short' })
+}
+
 function replyPreview(reply: MessageReply): string {
   const text = reply.content?.trim()
   if (text) return text
@@ -30,7 +49,9 @@ function StatusTicks({ message }: { message: ChatMessage }) {
   if (message.pending)
     return <Clock className="h-3.5 w-3.5 opacity-70" aria-label="Sending" />
   if (message.status === 'read')
-    return <CheckCheck className="h-3.5 w-3.5" aria-label="Read" />
+    return (
+      <CheckCheck className="h-3.5 w-3.5 text-sky-500 dark:text-sky-400" aria-label="Read" />
+    )
   if (message.status === 'delivered')
     return <CheckCheck className="h-3.5 w-3.5 opacity-70" aria-label="Delivered" />
   return <Check className="h-3.5 w-3.5 opacity-70" aria-label="Sent" />
@@ -45,8 +66,17 @@ export type MessageItemProps = {
   onOpenAttachment: (attachments: Attachment[], index: number) => void
   onReply?: (message: ChatMessage) => void
   onForward?: (message: ChatMessage) => void
+  /** Open the delivery/read "Message info" screen. Own messages only (sender-scoped endpoint). */
+  onOpenInfo?: (message: ChatMessage) => void
   onRetry?: (message: ChatMessage) => void
   onJumpToMessage?: (messageId: string) => void
+  /** Ask the parent to open this message's inline editor. Only offered while editable. */
+  onStartEdit?: (message: ChatMessage) => void
+  /** True while this message's inline editor is open (owned by the parent). */
+  editing?: boolean
+  onCancelEdit?: () => void
+  /** Persists the new content; rejects on failure so the editor stays open. */
+  onSubmitEdit?: (message: ChatMessage, content: string) => Promise<void>
 }
 
 export const MessageItem = memo(function MessageItem({
@@ -58,19 +88,73 @@ export const MessageItem = memo(function MessageItem({
   onOpenAttachment,
   onReply,
   onForward,
+  onOpenInfo,
   onRetry,
   onJumpToMessage,
+  onStartEdit,
+  editing = false,
+  onCancelEdit,
+  onSubmitEdit,
 }: MessageItemProps) {
   const text = message.content
   const attachments = message.attachments
   const senderName = message.sender.displayName || message.sender.username
   const hasAttachments = attachments.length > 0
   const reply = message.replyTo
+  // Quoted text rendered in the reply card; direction comes from its first letter.
+  const preview = reply ? replyPreview(reply) : ''
 
   const rowRef = useRef<HTMLDivElement>(null)
   const hintRef = useRef<HTMLDivElement>(null)
+  const editRef = useRef<HTMLTextAreaElement>(null)
   const gesture = useRef({ startX: 0, startY: 0, tracking: false, active: false, dx: 0 })
   const [swiping, setSwiping] = useState(false)
+  const [draft, setDraft] = useState(text)
+  const [saving, setSaving] = useState(false)
+  // Flips once the 15-minute edit window closes so the control disappears live.
+  const [windowClosed, setWindowClosed] = useState(() => !withinEditWindow(message.createdAt))
+
+  const canEdit = Boolean(onStartEdit) && !windowClosed && isEditableMessage(message, isOwn)
+
+  useEffect(() => {
+    if (windowClosed) return
+    const deadline = new Date(message.createdAt).getTime() + EDIT_WINDOW_MS
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) {
+      setWindowClosed(true)
+      return
+    }
+    const timer = window.setTimeout(() => setWindowClosed(true), remaining + 1000)
+    return () => window.clearTimeout(timer)
+  }, [windowClosed, message.createdAt])
+
+  // Prime the editor from the current text and put the caret at the end.
+  useEffect(() => {
+    if (!editing) return
+    setDraft(message.content)
+    const el = editRef.current
+    if (!el) return
+    el.focus()
+    const end = el.value.length
+    el.setSelectionRange(end, end)
+  }, [editing, message.content])
+
+  const handleSave = async () => {
+    const content = draft.trim()
+    if (!content || saving || !onSubmitEdit) return
+    if (content === message.content) {
+      onCancelEdit?.()
+      return
+    }
+    setSaving(true)
+    try {
+      await onSubmitEdit(message, content)
+    } catch {
+      // The parent surfaces the failure; keep the editor open so the draft survives.
+    } finally {
+      setSaving(false)
+    }
+  }
 
   const resetSwipe = () => {
     if (rowRef.current) rowRef.current.style.transform = ''
@@ -190,28 +274,16 @@ export const MessageItem = memo(function MessageItem({
             <button
               type="button"
               onClick={() => onJumpToMessage?.(reply.id)}
-              className={cn(
-                'flex max-w-full flex-col gap-0.5 overflow-hidden rounded-lg border-l-2 px-2.5 py-1.5 text-left transition-colors',
-                isOwn
-                  ? 'border-primary-foreground/50 bg-primary-foreground/10 hover:bg-primary-foreground/20'
-                  : 'border-primary/60 bg-muted/70 hover:bg-muted',
-              )}
+              className="flex max-w-full flex-col gap-0.5 overflow-hidden rounded-lg border border-border border-l-2 border-l-primary bg-muted px-2.5 py-1.5 text-start transition-colors hover:border-primary"
             >
-              <span
-                className={cn(
-                  'text-[11px] font-semibold',
-                  isOwn ? 'text-primary-foreground' : 'text-primary',
-                )}
-              >
+              <span className="text-[11px] font-semibold text-primary">
                 {reply.sender.displayName || reply.sender.username}
               </span>
               <span
-                className={cn(
-                  'line-clamp-2 max-w-[16rem] text-xs',
-                  isOwn ? 'text-primary-foreground/80' : 'text-muted-foreground',
-                )}
+                dir={textDirection(preview)}
+                className="line-clamp-2 max-w-[16rem] text-xs text-muted-foreground"
               >
-                {replyPreview(reply)}
+                {preview}
               </span>
             </button>
           )}
@@ -231,8 +303,9 @@ export const MessageItem = memo(function MessageItem({
             </div>
           )}
 
-          {text && (
+          {text && !editing && (
             <div
+              dir={textDirection(text)}
               className={cn(
                 'rounded-2xl px-3.5 py-2 text-sm break-words whitespace-pre-wrap',
                 isOwn
@@ -242,6 +315,57 @@ export const MessageItem = memo(function MessageItem({
             >
               {text}
             </div>
+          )}
+
+          {editing && (
+            <form
+              data-no-swipe
+              className="w-full min-w-64 max-w-full"
+              onSubmit={(event) => {
+                event.preventDefault()
+                void handleSave()
+              }}
+            >
+              <Textarea
+                ref={editRef}
+                value={draft}
+                dir={textDirection(draft)}
+                onChange={(event) => setDraft(event.target.value)}
+                onKeyDown={(event) => {
+                  if (event.key === 'Escape') {
+                    event.preventDefault()
+                    onCancelEdit?.()
+                  }
+                  if (event.key === 'Enter' && (event.metaKey || event.ctrlKey)) {
+                    event.preventDefault()
+                    void handleSave()
+                  }
+                }}
+                rows={2}
+                maxLength={4000}
+                aria-label="Edit message"
+                className="min-h-16"
+              />
+              <div className="mt-1 flex items-center justify-end gap-2">
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onCancelEdit?.()}
+                  disabled={saving}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" size="sm" disabled={saving || !draft.trim()}>
+                  {saving ? (
+                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                  ) : (
+                    <Check className="h-3.5 w-3.5" />
+                  )}
+                  Save
+                </Button>
+              </div>
+            </form>
           )}
         </div>
 
@@ -270,25 +394,62 @@ export const MessageItem = memo(function MessageItem({
             <>
               <span>{formatTime(message.createdAt)}</span>
               {isOwn && <StatusTicks message={message} />}
-              {onReply && (
-                <button
-                  type="button"
-                  onClick={() => onReply(message)}
-                  aria-label="Reply to message"
-                  className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 max-md:opacity-100"
-                >
-                  <CornerUpLeft className="h-3.5 w-3.5" />
-                </button>
+              {message.editedAt && (
+                <span className="italic" title={`Edited ${formatDateTime(message.editedAt)}`}>
+                  Edited
+                </span>
               )}
-              {onForward && (
-                <button
-                  type="button"
-                  onClick={() => onForward(message)}
-                  aria-label="Forward message"
-                  className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 max-md:opacity-100"
-                >
-                  <Forward className="h-3.5 w-3.5" />
-                </button>
+              {!editing && onStartEdit && canEdit && (
+                <Tooltip>
+                  <TooltipTrigger
+                    type="button"
+                    onClick={() => onStartEdit(message)}
+                    aria-label="Edit message"
+                    className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 max-md:opacity-100"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </TooltipTrigger>
+                  <TooltipContent>Edit</TooltipContent>
+                </Tooltip>
+              )}
+              {!editing && onReply && (
+                <Tooltip>
+                  <TooltipTrigger
+                    type="button"
+                    onClick={() => onReply(message)}
+                    aria-label="Reply to message"
+                    className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 max-md:opacity-100"
+                  >
+                    <CornerUpLeft className="h-3.5 w-3.5" />
+                  </TooltipTrigger>
+                  <TooltipContent>Reply</TooltipContent>
+                </Tooltip>
+              )}
+              {!editing && onForward && (
+                <Tooltip>
+                  <TooltipTrigger
+                    type="button"
+                    onClick={() => onForward(message)}
+                    aria-label="Forward message"
+                    className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 max-md:opacity-100"
+                  >
+                    <Forward className="h-3.5 w-3.5" />
+                  </TooltipTrigger>
+                  <TooltipContent>Forward</TooltipContent>
+                </Tooltip>
+              )}
+              {!editing && isOwn && !message.pending && onOpenInfo && (
+                <Tooltip>
+                  <TooltipTrigger
+                    type="button"
+                    onClick={() => onOpenInfo(message)}
+                    aria-label="Message info"
+                    className="flex h-5 w-5 items-center justify-center rounded text-muted-foreground opacity-0 transition-opacity hover:text-foreground focus-visible:opacity-100 group-hover:opacity-100 max-md:opacity-100"
+                  >
+                    <Info className="h-3.5 w-3.5" />
+                  </TooltipTrigger>
+                  <TooltipContent>Message info</TooltipContent>
+                </Tooltip>
               )}
             </>
           )}

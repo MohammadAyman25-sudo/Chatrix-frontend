@@ -1,4 +1,4 @@
-import { ArrowLeft, Info, Users } from 'lucide-react'
+import { ArrowLeft, Images, Info, Search, Users, X } from 'lucide-react'
 import { cn } from 'cn'
 import type { Conversation } from '@/types/api'
 import { otherParticipant } from '@/lib/conversations'
@@ -16,6 +16,10 @@ export function ConversationHeader({
   infoActive,
   onOpenInfo,
   onBack,
+  searchActive,
+  onToggleSearch,
+  mediaActive,
+  onToggleMedia,
 }: {
   conversation: Conversation
   meId: string | undefined
@@ -29,6 +33,12 @@ export function ConversationHeader({
   infoActive?: boolean
   onOpenInfo: () => void
   onBack: () => void
+  /** Highlighted state and toggle for the in-conversation message search. */
+  searchActive?: boolean
+  onToggleSearch: () => void
+  /** Highlighted state and toggle for the media/links/docs panel. */
+  mediaActive?: boolean
+  onToggleMedia: () => void
 }) {
   const isGroup = conversation.type === 'group'
   const other = otherParticipant(conversation, meId)
@@ -73,21 +83,25 @@ export function ConversationHeader({
         <ArrowLeft className="h-5 w-5" />
       </Button>
 
-      <button
-        type="button"
-        onClick={onOpenInfo}
-        className="-mx-1 flex min-w-0 flex-1 items-center gap-3 rounded-lg px-1 py-0.5 text-left transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none"
-        aria-label={isGroup ? 'Open group members' : 'View profile'}
-      >
+      <div className="-mx-1 flex min-w-0 flex-1 items-center gap-3 px-1 py-0.5">
+        {/* The avatar is its own target (tap to view the photo); the name and
+            subtitle below open the member list / profile. Nesting one button
+            inside the other is invalid, hence the sibling layout. */}
         <UserAvatar
           name={title}
           avatarUrl={isGroup ? conversation.avatarUrl : other?.avatarUrl}
           size="lg"
           status={isGroup ? undefined : other ? presenceOnline ? 'online' : 'offline' : undefined}
           fallback={isGroup ? <Users className="h-4 w-4" /> : undefined}
+          viewable
         />
 
-        <div className="min-w-0 flex-1">
+        <button
+          type="button"
+          onClick={onOpenInfo}
+          className="min-w-0 flex-1 rounded-lg px-1 py-0.5 text-left transition-colors hover:bg-muted focus-visible:bg-muted focus-visible:outline-none"
+          aria-label={isGroup ? 'Open group members' : 'View profile'}
+        >
           <h1 className="truncate text-sm font-semibold">{title}</h1>
           <p
             className={cn(
@@ -109,8 +123,32 @@ export function ConversationHeader({
             )}
             {subtitle}
           </p>
-        </div>
-      </button>
+        </button>
+      </div>
+
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className={cn('shrink-0', searchActive && 'bg-muted text-foreground')}
+        aria-label="Search messages in this conversation"
+        aria-pressed={searchActive}
+        onClick={onToggleSearch}
+      >
+        <Search className="h-5 w-5" />
+      </Button>
+
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className={cn('shrink-0', mediaActive && 'bg-muted text-foreground')}
+        aria-label="Media, links and docs"
+        aria-pressed={mediaActive}
+        onClick={onToggleMedia}
+      >
+        <Images className="h-5 w-5" />
+      </Button>
 
       <Button
         type="button"
@@ -122,6 +160,19 @@ export function ConversationHeader({
         onClick={onOpenInfo}
       >
         {isGroup ? <Users className="h-5 w-5" /> : <Info className="h-5 w-5" />}
+      </Button>
+
+      {/* Mobile reaches the list via the back arrow; on desktop the chat is
+          the full pane, so an explicit close control is needed. */}
+      <Button
+        type="button"
+        variant="ghost"
+        size="icon"
+        className="hidden shrink-0 md:inline-flex"
+        aria-label="Close chat"
+        onClick={onBack}
+      >
+        <X className="h-5 w-5" />
       </Button>
     </header>
   )

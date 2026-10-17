@@ -12,6 +12,7 @@ import {
   FileText,
   Image as ImageIcon,
   Loader2,
+  Lock,
   Mic,
   Paperclip,
   RotateCw,
@@ -31,9 +32,9 @@ import {
   MAX_ATTACHMENTS_PER_UPLOAD,
   MAX_ATTACHMENT_BYTES,
   revokePendingAttachment,
-  uploadAttachments,
   type PendingAttachment,
 } from '@/lib/attachments'
+import { uploadMessageAttachment } from '@/lib/uploads'
 import { isRecordingSupported, startRecording, type ActiveRecorder } from '@/lib/voice-recorder'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
@@ -50,7 +51,7 @@ const ACCEPT = {
   video: 'video/*',
   audio: 'audio/*',
   document:
-    '.pdf,.doc,.docx,.txt,.rtf,.csv,.xls,.xlsx,.ppt,.pptx,.zip,.json,.md,.odt,.ods,application/*',
+    '.pdf,.doc,.docx,.txt,.rtf,.csv,.xls,.xlsx,.ppt,.pptx,.zip,.json,application/*',
 } as const
 
 export type ComposerSendInput = {
@@ -58,6 +59,8 @@ export type ComposerSendInput = {
   type: MessageType
   attachments: Attachment[]
   replyToId?: string
+  /** Deliver the reply as a DM to the quoted message's author (`replyPrivately`). */
+  replyPrivately?: boolean
 }
 
 export type ComposerHandle = {
@@ -69,6 +72,11 @@ export type ComposerProps = {
   conversationId: string
   replyTo: ChatMessage | null
   onCancelReply: () => void
+  /**
+   * Offer the "reply privately" option while composing a reply. Only true in
+   * groups when the quoted message is someone else's (see `canReplyPrivately`).
+   */
+  canReplyPrivately?: boolean
   onSend: (input: ComposerSendInput) => Promise<unknown>
   onTyping?: (isTyping: boolean) => void
   onRecordingChange?: (isRecording: boolean, conversationId: string) => void
@@ -158,6 +166,7 @@ export function Composer({
   conversationId,
   replyTo,
   onCancelReply,
+  canReplyPrivately,
   onSend,
   onTyping,
   onRecordingChange,
@@ -171,6 +180,9 @@ export function Composer({
   const [attachError, setAttachError] = useState<string | null>(null)
   const [recording, setRecording] = useState(false)
   const [elapsedMs, setElapsedMs] = useState(0)
+  // Which quoted message the "reply privately" toggle is armed for. Keyed by id
+  // so switching/cancelling the reply disarms it without an effect.
+  const [privateReplyFor, setPrivateReplyFor] = useState<string | null>(null)
 
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
@@ -199,6 +211,12 @@ export function Composer({
       onTypingRef.current?.(false)
     }
   }, [])
+
+  // Cancel a reply and disarm the private-reply choice that was tied to it.
+  const cancelReply = useCallback(() => {
+    setPrivateReplyFor(null)
+    onCancelReply()
+  }, [onCancelReply])
 
   const stopRecording = useCallback(
     (send: boolean) => {
@@ -234,6 +252,7 @@ export function Composer({
     stopTyping()
     stopRecordingRef.current(false)
     setText('')
+    setPrivateReplyFor(null)
     setPending((prev) => {
       for (const item of prev) revokePendingAttachment(item)
       return []
@@ -249,36 +268,33 @@ export function Composer({
     }
   }, [])
 
+  // Each file runs the sign → PUT → confirm flow on its own, so one rejection
+  // only fails that chip while the others keep their confirmed attachment.
   const startUpload = useCallback(
     async (items: PendingAttachment[]) => {
-      if (items.length === 0) return
-      const cid = conversationId
-      try {
-        const attachments = await uploadAttachments(
-          cid,
-          items.map((item) => item.file),
-        )
-        if (activeConversation.current !== cid) return
-        setPending((prev) =>
-          prev.map((item) => {
-            const index = items.findIndex((candidate) => candidate.id === item.id)
-            if (index === -1) return item
-            const uploaded = attachments[index]
-            return uploaded
-              ? { ...item, status: 'ready', attachment: uploaded, error: undefined }
-              : { ...item, status: 'error', error: 'Upload failed.' }
-          }),
-        )
-      } catch (error) {
-        if (activeConversation.current !== cid) return
-        const message = apiErrorMessage(error, 'Upload failed.')
-        setPending((prev) =>
-          prev.map((item) =>
-            items.some((candidate) => candidate.id === item.id)
-              ? { ...item, status: 'error', error: message }
-              : item,
-          ),
-        )
+      for (const item of items) {
+        const cid = conversationId
+        try {
+          const attachment = await uploadMessageAttachment(cid, item.file, item.duration)
+          if (activeConversation.current !== cid) return
+          setPending((prev) =>
+            prev.map((candidate) =>
+              candidate.id === item.id
+                ? { ...candidate, status: 'ready', attachment, error: undefined }
+                : candidate,
+            ),
+          )
+        } catch (error) {
+          if (activeConversation.current !== cid) return
+          const message = apiErrorMessage(error, 'Upload failed.')
+          setPending((prev) =>
+            prev.map((candidate) =>
+              candidate.id === item.id
+                ? { ...candidate, status: 'error', error: message }
+                : candidate,
+            ),
+          )
+        }
       }
     },
     [conversationId],
@@ -381,6 +397,10 @@ export function Composer({
   const readyAttachments = pending.filter((item) => item.status === 'ready')
   const hasUploading = pending.some((item) => item.status === 'uploading')
   const hasUploadError = pending.some((item) => item.status === 'error')
+  const privateReplyActive = Boolean(
+    canReplyPrivately && replyToId && privateReplyFor === replyToId,
+  )
+  const replyPreviewName = replyTo ? replyTo.sender.displayName || replyTo.sender.username : ''
   const canSend =
     !sending &&
     !recording &&
@@ -403,13 +423,14 @@ export function Composer({
         type: attachments.length > 0 ? attachments[0].type : 'text',
         attachments,
         replyToId,
+        replyPrivately: privateReplyActive || undefined,
       })
       setText('')
       setPending((prev) => {
         for (const item of prev) revokePendingAttachment(item)
         return []
       })
-      onCancelReply()
+      cancelReply()
     } catch (error) {
       onError?.(apiErrorMessage(error, 'Message failed to send.'))
     } finally {
@@ -459,14 +480,17 @@ export function Composer({
     })
     setSending(true)
     try {
-      const attachments = await uploadAttachments(conversationId, [file], recorded.duration)
+      // Voice notes run the same direct upload flow with the recorded duration,
+      // then go out as a normal audio message.
+      const attachment = await uploadMessageAttachment(conversationId, file, recorded.duration)
       await onSend({
         content: '',
         type: 'audio',
-        attachments,
+        attachments: [attachment],
         replyToId,
+        replyPrivately: privateReplyActive || undefined,
       })
-      onCancelReply()
+      cancelReply()
     } catch (error) {
       onError?.(apiErrorMessage(error, 'Voice message failed to send.'))
     } finally {
@@ -489,19 +513,39 @@ export function Composer({
       />
 
       {replyTo && !recording && (
-        <div className="flex items-start gap-2 border-b bg-muted/40 px-3 py-2 sm:px-4">
+        <div className="flex items-start gap-2 border-b border-l-2 border-l-primary bg-muted px-3 py-2 sm:px-4">
           <CornerUpLeft className="mt-0.5 h-4 w-4 shrink-0 text-primary" aria-hidden="true" />
           <div className="min-w-0 flex-1">
             <div className="text-xs font-semibold text-primary">
-              Replying to {replyTo.sender.displayName || replyTo.sender.username}
+              {privateReplyActive
+                ? `Replying privately to ${replyPreviewName}`
+                : `Replying to ${replyPreviewName}`}
             </div>
             <div className="truncate text-xs text-muted-foreground">
               <ReplyPreviewText message={replyTo} />
             </div>
+            {canReplyPrivately && (
+              <button
+                type="button"
+                onClick={() =>
+                  setPrivateReplyFor((current) => (current === replyToId ? null : (replyToId ?? null)))
+                }
+                aria-pressed={privateReplyActive}
+                className={cn(
+                  'mt-1 inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-medium transition-colors',
+                  privateReplyActive
+                    ? 'border-primary bg-primary/10 text-primary'
+                    : 'border-transparent text-muted-foreground hover:border-border hover:text-foreground',
+                )}
+              >
+                <Lock className="h-3 w-3" aria-hidden="true" />
+                Reply privately
+              </button>
+            )}
           </div>
           <button
             type="button"
-            onClick={onCancelReply}
+            onClick={cancelReply}
             aria-label="Cancel reply"
             className="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-muted-foreground transition-colors hover:bg-background hover:text-foreground"
           >
@@ -616,7 +660,13 @@ export function Composer({
                 void addFiles(files)
               }
             }}
-            placeholder={replyTo ? 'Write a reply…' : 'Type a message…'}
+            placeholder={
+              privateReplyActive
+                ? 'Write a private reply…'
+                : replyTo
+                  ? 'Write a reply…'
+                  : 'Type a message…'
+            }
             rows={1}
             className={cn('min-h-10 min-w-0 flex-1 resize-none py-2.5')}
             onKeyDown={(e) => {

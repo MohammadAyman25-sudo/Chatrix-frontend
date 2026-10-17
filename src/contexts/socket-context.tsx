@@ -1,6 +1,7 @@
 import { createContext, useContext, useEffect, useRef, useState } from 'react'
 import { io } from 'socket.io-client'
 import type { AppSocket } from '@/lib/app-socket'
+import { API_ORIGIN } from '@/lib/media'
 import { USE_MOCK, MOCK_AUTO_REPLY } from '@/lib/mock/config'
 import { createMockSocket } from '@/lib/mock/socket'
 import { setAutoReply } from '@/lib/mock/client'
@@ -45,7 +46,7 @@ export function SocketProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    const s = io('http://localhost:5000', {
+    const s = io(API_ORIGIN, {
       withCredentials: true,
       transports: ['websocket'],
     })

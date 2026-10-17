@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Link, Outlet, useNavigate, useParams } from 'react-router-dom'
-import { Loader2, MessageSquarePlus, RefreshCw, Search, Settings, User, Users } from 'lucide-react'
+import { Link, Outlet, useLocation, useNavigate, useParams } from 'react-router-dom'
+import { Loader2, MessageSquarePlus, RefreshCw, Search, Settings, Settings2, User, Users } from 'lucide-react'
 import { cn } from 'cn'
 import api from '@/lib/api'
-import type { Conversation, PaginatedConversations } from '@/types/api'
+import type { Conversation, Message, PaginatedConversations } from '@/types/api'
 import { useAuth } from '@/contexts/auth-context'
 import { usePresence } from '@/contexts/presence-context'
 import { useSocket } from '@/contexts/socket-context'
@@ -37,6 +37,7 @@ export function ChatLayout() {
   const { getPresence, loadConversationPresence } = usePresence()
   const { socket } = useSocket()
   const navigate = useNavigate()
+  const location = useLocation()
   const { conversationId } = useParams()
 
   const { results: searchResults, loading: searchLoading } = useUserSearch(search)
@@ -68,6 +69,45 @@ export function ChatLayout() {
     })
   }, [])
 
+  const removeConversation = useCallback((id: string) => {
+    setConversations((prev) => prev.filter((c) => c.id !== id))
+  }, [])
+
+  // The sidebar owns the unread badges: `unreadCount` only comes from
+  // `GET /conversations`, so we increment on `message:new` (messages from
+  // others, in chats that aren't open) and clear on opening a chat — matching
+  // the `message:read` the room sends.
+  const meId = user?.id
+  useEffect(() => {
+    if (!socket || !meId) return
+    const handleNew = (...args: unknown[]) => {
+      const message = args[0] as Message
+      if (!message?.conversationId || message.sender?.id === meId) return
+      if (message.conversationId === conversationId) return
+      setConversations((prev) =>
+        prev.map((c) =>
+          c.id === message.conversationId
+            ? { ...c, unreadCount: (c.unreadCount ?? 0) + 1 }
+            : c,
+        ),
+      )
+    }
+    socket.on('message:new', handleNew)
+    return () => {
+      socket.off('message:new', handleNew)
+    }
+  }, [socket, meId, conversationId])
+
+  // Opening a chat clears its badge (the room emits `message:read` too).
+  useEffect(() => {
+    if (!conversationId) return
+    setConversations((prev) => {
+      const target = prev.find((c) => c.id === conversationId)
+      if (!target || !target.unreadCount) return prev
+      return prev.map((c) => (c.id === conversationId ? { ...c, unreadCount: 0 } : c))
+    })
+  }, [conversationId])
+
   // Keep the sidebar in sync with new conversations and group changes.
   useEffect(() => {
     if (!socket) return
@@ -75,13 +115,24 @@ export function ChatLayout() {
       const conversation = args[0] as Conversation
       if (conversation?.id) upsertConversation(conversation)
     }
+    // The group owner removed the signed-in user: drop the chat (and leave the
+    // room if it is the one on screen).
+    const handleConversationRemoved = (...args: unknown[]) => {
+      const payload = args[0] as { conversationId?: string }
+      const removedId = payload?.conversationId
+      if (!removedId) return
+      removeConversation(removedId)
+      if (removedId === conversationId) navigate('/chat', { replace: true })
+    }
     socket.on('conversation:new', handleConversation)
     socket.on('conversation:updated', handleConversation)
+    socket.on('conversation:removed', handleConversationRemoved)
     return () => {
       socket.off('conversation:new', handleConversation)
       socket.off('conversation:updated', handleConversation)
+      socket.off('conversation:removed', handleConversationRemoved)
     }
-  }, [socket, upsertConversation])
+  }, [socket, upsertConversation, removeConversation, conversationId, navigate])
 
   const startDirect = async (participant: { id: string }) => {
     try {
@@ -187,6 +238,7 @@ export function ChatLayout() {
                     ? conversation.participants.find((p) => p.id !== user?.id)
                     : null
                 const isActive = conversation.id === conversationId
+                const unread = conversation.unreadCount ?? 0
                 return (
                   <Link
                     key={conversation.id}
@@ -216,7 +268,12 @@ export function ChatLayout() {
                       }
                     />
                     <div className="min-w-0 flex-1">
-                      <div className="truncate text-sm font-medium">
+                      <div
+                        className={cn(
+                          'truncate text-sm',
+                          unread > 0 ? 'font-semibold' : 'font-medium',
+                        )}
+                      >
                         {conversationTitle(conversation, user?.id)}
                       </div>
                       <div className="truncate text-xs text-muted-foreground">
@@ -232,6 +289,14 @@ export function ChatLayout() {
                             : 'No messages yet'}
                       </div>
                     </div>
+                    {unread > 0 && (
+                      <span className="flex h-5 min-w-5 shrink-0 items-center justify-center rounded-full bg-primary px-1.5 text-[11px] font-semibold text-primary-foreground tabular-nums">
+                        <span aria-hidden="true">{unread > 99 ? '99+' : unread}</span>
+                        <span className="sr-only">
+                          {unread === 1 ? '1 unread message' : `${unread} unread messages`}
+                        </span>
+                      </span>
+                    )}
                   </Link>
                 )
               })}
@@ -265,6 +330,11 @@ export function ChatLayout() {
               <Settings className="h-4 w-4" />
             </DropdownMenuTrigger>
             <DropdownMenuContent align="end">
+              <DropdownMenuItem
+                onClick={() => navigate('/settings', { state: { from: location.pathname } })}
+              >
+                <Settings2 className="h-4 w-4" /> Settings
+              </DropdownMenuItem>
               <DropdownMenuItem onClick={() => setProfileOpen(true)}>
                 <User className="h-4 w-4" /> Profile
               </DropdownMenuItem>
@@ -294,6 +364,7 @@ export function ChatLayout() {
               conversations,
               conversationsLoading: loading,
               upsertConversation,
+              removeConversation,
             } satisfies ChatOutletContext
           }
         />

@@ -5,4 +5,6 @@ export type ChatOutletContext = {
   conversations: Conversation[]
   conversationsLoading: boolean
   upsertConversation: (conversation: Conversation) => void
+  /** Drops a conversation from the sidebar, e.g. when the owner removed you. */
+  removeConversation: (conversationId: string) => void
 }

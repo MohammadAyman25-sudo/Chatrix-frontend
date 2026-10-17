@@ -6,13 +6,22 @@
  */
 import type { AppSocket, SocketHandler } from '@/lib/app-socket'
 import type { Conversation, Message, MessageType, Attachment } from '@/types/api'
-import { createOutgoingMessage } from './client'
-import { bus, currentUser, forwardMessage, getPresence, setPresence } from './data'
+import { createOutgoingMessage, createPrivateReply } from './client'
+import {
+  bus,
+  currentUser,
+  editMessage,
+  forwardMessage,
+  getPresence,
+  markConversationRead,
+  setPresence,
+} from './data'
 
 const FORWARDED_EVENTS = [
   'message:new',
   'conversation:new',
   'conversation:updated',
+  'conversation:removed',
   'typing:update',
   'recording:update',
   'message:status',
@@ -65,15 +74,43 @@ export function createMockSocket(): AppSocket {
           type?: MessageType
           attachments?: Attachment[]
           replyToId?: string
+          replyPrivately?: boolean
         }
         const ack = args[1] as
-          | ((res: { ok?: boolean; message?: Message; error?: string }) => void)
+          | ((res: {
+              ok?: boolean
+              message?: Message
+              conversation?: Conversation
+              error?: string
+            }) => void)
           | undefined
         window.setTimeout(() => {
           const hasContent = Boolean(payload?.content?.trim())
           const hasAttachments = Boolean(payload?.attachments?.length)
           if (!payload?.conversationId || (!hasContent && !hasAttachments)) {
             ack?.({ ok: false, error: 'Invalid payload' })
+            return
+          }
+          if (payload.replyPrivately) {
+            if (!payload.replyToId) {
+              ack?.({ ok: false, error: 'A reply target is required.' })
+              return
+            }
+            try {
+              const result = createPrivateReply({
+                sourceConversationId: payload.conversationId,
+                replyToId: payload.replyToId,
+                content: payload.content,
+                type: payload.type,
+                attachments: payload.attachments,
+              })
+              ack?.({ ok: true, message: result.message, conversation: result.conversation })
+            } catch (error) {
+              ack?.({
+                ok: false,
+                error: error instanceof Error ? error.message : 'Could not send the reply.',
+              })
+            }
             return
           }
           ack?.({
@@ -131,8 +168,38 @@ export function createMockSocket(): AppSocket {
           ack?.({ ok: true, messages: result.messages, conversations: result.conversations })
         }, 120)
       }
-      // typing:start / typing:stop / recording:start / recording:stop /
-      // message:read are intentionally no-ops here.
+      if (event === 'message:read') {
+        const payload = args[0] as { conversationId?: string }
+        if (payload?.conversationId) markConversationRead(payload.conversationId)
+      }
+      if (event === 'message:edit') {
+        const payload = args[0] as {
+          conversationId?: string
+          messageId?: string
+          content?: string
+        }
+        const ack = args[1] as
+          | ((res: { ok?: boolean; message?: Message; error?: string }) => void)
+          | undefined
+        window.setTimeout(() => {
+          if (!payload?.conversationId || !payload?.messageId) {
+            ack?.({ ok: false, error: 'Invalid payload' })
+            return
+          }
+          const result = editMessage(
+            payload.conversationId,
+            payload.messageId,
+            payload.content ?? '',
+          )
+          if (!result.ok) {
+            ack?.({ ok: false, error: result.error })
+            return
+          }
+          ack?.({ ok: true, message: result.message })
+        }, 120)
+      }
+      // typing:start / typing:stop / recording:start / recording:stop are
+      // intentionally no-ops here.
       return socket
     },
     disconnect() {

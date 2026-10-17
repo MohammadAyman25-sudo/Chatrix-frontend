@@ -15,17 +15,17 @@ import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 export function VerifyEmailGate() {
   const { user, resendVerification, logout } = useAuth()
   const [sending, setSending] = useState(false)
-  const [sent, setSent] = useState(false)
+  const [sentMessage, setSentMessage] = useState('')
   const [error, setError] = useState('')
 
   const resend = async () => {
     if (!user || sending) return
     setSending(true)
     setError('')
-    setSent(false)
+    setSentMessage('')
     try {
-      await resendVerification(user.email)
-      setSent(true)
+      const sent = await resendVerification(user.email)
+      setSentMessage(sent)
     } catch (err) {
       setError(apiErrorMessage(err, 'Could not send the verification email.'))
     } finally {
@@ -47,9 +47,9 @@ export function VerifyEmailGate() {
             You need to verify your email before you can use Chatrix. We sent a link to{' '}
             <span className="font-medium text-foreground">{user?.email}</span>.
           </p>
-          {sent && (
+          {sentMessage && (
             <p role="status" className="text-sm text-emerald-600 dark:text-emerald-400">
-              Verification email sent.
+              {sentMessage}
             </p>
           )}
           {error && (
